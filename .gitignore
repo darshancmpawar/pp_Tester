@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.pkl
+*.keras
+# Allow committed model artifacts under artifacts/ — produced by
+# scripts/train.py (locally or via the Train Models GitHub Action).
+!artifacts/*.pkl
+!artifacts/*.keras
+!artifacts/.gitkeep

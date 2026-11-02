@@ -1,0 +1,406 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,300;0,400;0,500;0,600;0,700&display=swap');
+
+/* ── TOKENS ── */
+:root {
+    --bg:       #0b0d14;
+    --surf:     #11131c;
+    --card:     #181b27;
+    --card2:    #1e2235;
+    --border:   #242838;
+    --border2:  rgba(255,255,255,.05);
+    --accent:   #4f8ef7;
+    --adim:     rgba(79,142,247,.13);
+    --alow:     rgba(79,142,247,.06);
+    --purple:   #a78bfa;
+    --pdim:     rgba(167,139,250,.1);
+    --green:    #34d399;
+    --amber:    #fbbf24;
+    --red:      #f87171;
+    --text:     #eef0f8;
+    --tsec:     #7d849e;
+    --tmut:     #3c4162;
+    --grad:     linear-gradient(135deg,#4f8ef7 0%,#a78bfa 100%);
+    --r-sm:     6px;
+    --r-md:     8px;
+}
+
+/* ── RESET / GLOBAL ── */
+*, *::before, *::after { font-family:'Inter',sans-serif !important; box-sizing:border-box; }
+
+/* ── APP SHELL ── */
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"] { background:var(--bg) !important; }
+[data-testid="stHeader"] { background:transparent !important; }
+.main .block-container {
+    padding:1.25rem 2.5rem 4rem !important;
+    max-width:1260px !important;
+}
+
+/* ── TYPOGRAPHY ── */
+h1,h2,h3,h4 { color:var(--text) !important; font-weight:600 !important; letter-spacing:-.02em !important; }
+p,[data-testid="stMarkdownContainer"] p { color:var(--tsec) !important; line-height:1.6 !important; }
+label { color:var(--tsec) !important; font-size:.8rem !important; font-weight:500 !important; letter-spacing:.015em !important; }
+
+/* ── ALL FORM INPUTS (shared base) ── */
+.stTextInput  input,
+.stNumberInput input,
+.stDateInput  input {
+    background:var(--card) !important;
+    border:1px solid var(--border) !important;
+    border-radius:var(--r-sm) !important;
+    color:var(--text) !important;
+    font-size:.875rem !important;
+    transition:border-color .15s,box-shadow .15s !important;
+    padding:.5rem .85rem !important;
+}
+.stTextInput  input:focus,
+.stNumberInput input:focus,
+.stDateInput  input:focus {
+    border-color:var(--accent) !important;
+    box-shadow:0 0 0 3px var(--adim) !important;
+    outline:none !important;
+}
+.stTextInput  input::placeholder,
+.stNumberInput input::placeholder { color:var(--tmut) !important; }
+.stNumberInput [data-testid="stNumberInputContainer"] button {
+    background:var(--card2) !important;
+    border-color:var(--border) !important;
+    color:var(--tsec) !important;
+}
+
+/* ── SELECTBOX ── */
+[data-testid="stSelectbox"]>div>div {
+    background:var(--card) !important;
+    border:1px solid var(--border) !important;
+    border-radius:var(--r-sm) !important;
+    color:var(--text) !important;
+    font-size:.875rem !important;
+    transition:border-color .15s !important;
+}
+[data-testid="stSelectbox"]>div>div:focus-within {
+    border-color:var(--accent) !important;
+    box-shadow:0 0 0 3px var(--adim) !important;
+}
+
+/* ── MULTISELECT ── */
+[data-testid="stMultiSelect"]>div {
+    background:var(--card) !important;
+    border:1px solid var(--border) !important;
+    border-radius:var(--r-sm) !important;
+    transition:border-color .15s !important;
+}
+[data-testid="stMultiSelect"]>div:focus-within {
+    border-color:var(--accent) !important;
+    box-shadow:0 0 0 3px var(--adim) !important;
+}
+[data-testid="stMultiSelect"] [data-baseweb="tag"] {
+    background:var(--adim) !important;
+    color:var(--accent) !important;
+    border:1px solid rgba(79,142,247,.3) !important;
+    border-radius:4px !important;
+    font-size:.75rem !important;
+    font-weight:500 !important;
+}
+
+/* ── TEXTAREA ── */
+.stTextArea textarea {
+    background:var(--card) !important;
+    border:1px solid var(--border) !important;
+    border-radius:var(--r-sm) !important;
+    color:var(--text) !important;
+    font-size:.875rem !important;
+    transition:border-color .15s !important;
+}
+.stTextArea textarea:focus {
+    border-color:var(--accent) !important;
+    box-shadow:0 0 0 3px var(--adim) !important;
+}
+.stTextArea textarea::placeholder { color:var(--tmut) !important; }
+
+/* ── BUTTON ── */
+.stButton>button {
+    background:var(--accent) !important;
+    color:#fff !important;
+    border:none !important;
+    border-radius:var(--r-sm) !important;
+    padding:.48rem 1.5rem !important;
+    font-size:.875rem !important;
+    font-weight:500 !important;
+    letter-spacing:.01em !important;
+    transition:background .15s ease,box-shadow .15s ease !important;
+    box-shadow:none !important;
+}
+.stButton>button:hover {
+    background:#6aa3f8 !important;
+    box-shadow:0 0 0 3px var(--adim) !important;
+}
+.stButton>button:active { background:#3b7cf0 !important; }
+
+/* ── TABS ── */
+.stTabs [data-baseweb="tab-list"] {
+    background:var(--surf) !important;
+    border:1px solid var(--border) !important;
+    border-radius:var(--r-md) !important;
+    padding:3px !important;
+    gap:2px !important;
+    width:fit-content !important;
+}
+.stTabs [data-baseweb="tab"] {
+    background:transparent !important;
+    color:var(--tsec) !important;
+    border-radius:6px !important;
+    font-size:.855rem !important;
+    font-weight:500 !important;
+    padding:.42rem 1.2rem !important;
+    transition:background .15s,color .15s !important;
+    border:none !important;
+}
+.stTabs [data-baseweb="tab"]:hover {
+    background:var(--card) !important;
+    color:var(--text) !important;
+}
+/* Active tab — gradient bg, force all text to white */
+.stTabs [data-baseweb="tab"][aria-selected="true"] {
+    background:var(--grad) !important;
+    color:#ffffff !important;
+    font-weight:600 !important;
+}
+.stTabs [data-baseweb="tab"][aria-selected="true"] *,
+.stTabs [data-baseweb="tab"][aria-selected="true"] p,
+.stTabs [data-baseweb="tab"][aria-selected="true"] span,
+.stTabs [data-baseweb="tab"][aria-selected="true"] div {
+    color:#ffffff !important;
+}
+.stTabs [data-baseweb="tab-panel"] { padding-top:1.25rem !important; }
+
+/* ── TOGGLE / CHECKBOX ── */
+[data-testid="stToggle"] label,
+[data-testid="stCheckbox"] label { color:var(--tsec) !important; }
+
+/* ── METRICS ── */
+[data-testid="stMetric"] {
+    background:var(--card) !important;
+    border:1px solid var(--border) !important;
+    border-radius:var(--r-md) !important;
+    padding:.9rem 1.1rem !important;
+}
+[data-testid="stMetricValue"] {
+    color:var(--accent) !important;
+    font-size:1.55rem !important;
+    font-weight:700 !important;
+    letter-spacing:-.025em !important;
+}
+[data-testid="stMetricLabel"] {
+    color:var(--tmut) !important;
+    font-size:.7rem !important;
+    text-transform:uppercase !important;
+    letter-spacing:.09em !important;
+    font-weight:500 !important;
+}
+
+/* ── ALERTS ── */
+[data-testid="stAlert"] {
+    border-radius:var(--r-sm) !important;
+    border:1px solid transparent !important;
+}
+div[data-testid="stAlert"][data-type="success"] {
+    background:rgba(52,211,153,.07) !important;
+    border-left:3px solid var(--green) !important;
+}
+div[data-testid="stAlert"][data-type="warning"] {
+    background:rgba(251,191,36,.07) !important;
+    border-left:3px solid var(--amber) !important;
+}
+div[data-testid="stAlert"][data-type="error"] {
+    background:rgba(248,113,113,.07) !important;
+    border-left:3px solid var(--red) !important;
+}
+div[data-testid="stAlert"][data-type="info"] {
+    background:var(--pdim) !important;
+    border-left:3px solid var(--purple) !important;
+}
+
+/* ── DATAFRAME ── */
+[data-testid="stDataFrame"]>div {
+    border-radius:var(--r-md) !important;
+    overflow:hidden !important;
+    border:1px solid var(--border) !important;
+}
+
+/* ── DATA EDITOR ── */
+[data-testid="stDataEditor"] {
+    border:1px solid var(--border) !important;
+    border-radius:var(--r-sm) !important;
+    overflow:hidden !important;
+}
+
+/* ── MISC ── */
+[data-testid="stSpinner"]>div { color:var(--accent) !important; }
+hr { border-color:var(--border) !important; opacity:.6; margin:1.1rem 0 !important; }
+[data-testid="stCaptionContainer"] { color:var(--tmut) !important; font-size:.76rem !important; }
+::-webkit-scrollbar { width:4px; height:4px; }
+::-webkit-scrollbar-track { background:var(--bg); }
+::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+::-webkit-scrollbar-thumb:hover { background:#3a4060; }
+[data-baseweb="popover"],
+[data-baseweb="menu"] {
+    background:var(--card) !important;
+    border:1px solid var(--border) !important;
+    border-radius:var(--r-sm) !important;
+    box-shadow:0 8px 24px rgba(0,0,0,.4) !important;
+}
+[data-baseweb="menu"] li { color:var(--text) !important; }
+[data-baseweb="menu"] li:hover { background:var(--card2) !important; }
+
+/* ════════════════════════════════════════
+   CUSTOM LAYOUT COMPONENTS
+   ════════════════════════════════════════ */
+
+/* ── APP HEADER ── */
+.app-header {
+    display:flex;
+    align-items:flex-start;
+    gap:1rem;
+    padding:.5rem 0 1.4rem;
+    border-bottom:1px solid var(--border);
+    margin-bottom:1.4rem;
+}
+.app-header-icon {
+    font-size:1.55rem;
+    line-height:1;
+    margin-top:.15rem;
+    flex-shrink:0;
+}
+.app-header-text {}
+.app-title {
+    font-size:1.6rem;
+    font-weight:700;
+    color:var(--text);
+    letter-spacing:-.04em;
+    line-height:1.15;
+}
+.app-sub {
+    color:var(--tmut);
+    font-size:.78rem;
+    margin-top:.15rem;
+    letter-spacing:.01em;
+}
+
+/* ── CLIENT ROW ── */
+.client-meta {
+    display:flex;
+    align-items:center;
+    gap:.65rem;
+    padding-top:1.65rem;
+}
+.badge {
+    display:inline-block;
+    border-radius:4px;
+    padding:.17rem .62rem;
+    font-size:.7rem;
+    font-weight:600;
+    text-transform:uppercase;
+    letter-spacing:.08em;
+    line-height:1.5;
+}
+.badge-blue {
+    background:var(--adim);
+    color:var(--accent);
+    border:1px solid rgba(79,142,247,.25);
+}
+.badge-amber {
+    background:rgba(251,191,36,.1);
+    color:var(--amber);
+    border:1px solid rgba(251,191,36,.25);
+}
+.client-name {
+    color:var(--tmut);
+    font-size:.78rem;
+}
+.client-name strong { color:var(--tsec); font-weight:500; }
+
+/* ── SECTION HEADING ── */
+.sec {
+    display:flex;
+    align-items:center;
+    gap:.55rem;
+    margin:1.5rem 0 .8rem;
+    padding-bottom:.55rem;
+    border-bottom:1px solid var(--border);
+}
+.sec-icon { font-size:.9rem; line-height:1; }
+.sec-label {
+    color:var(--tsec);
+    font-size:.73rem;
+    font-weight:600;
+    text-transform:uppercase;
+    letter-spacing:.1em;
+}
+
+/* ── CONTEXT PILL ── */
+.ctx {
+    display:inline-flex;
+    align-items:center;
+    gap:.45rem;
+    background:var(--alow);
+    border:1px solid rgba(79,142,247,.18);
+    border-radius:var(--r-sm);
+    padding:.38rem .8rem;
+    font-size:.8rem;
+    color:var(--tsec);
+    margin:.3rem 0 .6rem;
+}
+.ctx strong { color:var(--text); font-weight:600; }
+
+/* ── PLAN RESULT CARD ── */
+.plan-card {
+    background:var(--card);
+    border:1px solid var(--border);
+    border-top:2px solid var(--accent);
+    border-radius:var(--r-md);
+    padding:.75rem 1rem;
+    margin-bottom:.35rem;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:.75rem;
+}
+.plan-card-vendor {
+    border-top-color:var(--purple);
+}
+.plan-card-aggressive {
+    border-top-color:var(--amber);
+}
+.plan-label {
+    color:var(--text);
+    font-weight:600;
+    font-size:.875rem;
+    display:flex;
+    align-items:center;
+    gap:.45rem;
+}
+.plan-chips {
+    display:flex;
+    gap:.4rem;
+    align-items:center;
+    flex-wrap:wrap;
+}
+
+/* ── CHIPS ── */
+.chip {
+    display:inline-block;
+    border-radius:4px;
+    padding:.16rem .62rem;
+    font-size:.75rem;
+    font-weight:600;
+    letter-spacing:.01em;
+    font-family:'Inter',sans-serif;
+    white-space:nowrap;
+}
+.chip-blue   { background:var(--adim); color:var(--accent); border:1px solid rgba(79,142,247,.25); }
+.chip-purple { background:var(--pdim); color:var(--purple); border:1px solid rgba(167,139,250,.25); }
+.chip-amber  { background:rgba(251,191,36,.1); color:var(--amber); border:1px solid rgba(251,191,36,.25); }
+
+/* ── TOASTTAB METRIC ROW ── */
+.metric-row { margin-top:.85rem; }

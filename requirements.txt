@@ -1,0 +1,5 @@
+tensorflow-cpu
+scikit-learn
+joblib
+openpyxl
+pandas
