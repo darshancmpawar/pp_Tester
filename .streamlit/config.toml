@@ -1,0 +1,10 @@
+# Streamlit's own defaults, aligned to styles.css. Without this the app paints
+# itself dark via CSS while Streamlit still believes it is light, so anything
+# CSS does not reach — native charts, dataframes, markdown lists — renders
+# light-on-dark. Values mirror the :root tokens in styles.css.
+[theme]
+base = "dark"
+backgroundColor = "#0b0d14"
+secondaryBackgroundColor = "#181b27"
+textColor = "#eef0f8"
+primaryColor = "#4f8ef7"

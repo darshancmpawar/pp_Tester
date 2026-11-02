@@ -10,7 +10,7 @@ Reading order (top to bottom matches the on-screen order):
        c. inputs:  date/context → non-veg items → shared MG → menu items
        d. Predict → per-item prediction → client / vendor / aggressive plans
        e. Special Day button (independent of Predict)
-       f. evaluation reference expander (static; how a model change is judged)
+       f. model scorecard expander (measured on the held-out days)
 
 Three objects drive everything and are read-only after the selector:
   CLIENT_KEY   lowercase id, e.g. "tekion" — prefixes artifacts and widget keys
@@ -29,6 +29,7 @@ from client_logic import get_logic
 from ml_core import (
     artifacts_exist, load_map, norm, fmt_cols,
     cats_match, get_nv_cats, predict,
+    evaluate_model, scorecard, model_mtime, BASELINE_RMSE,
 )
 from planner import (
     build_row, client_plan, fixed_pp_client_plan, vendor_plan,
@@ -130,80 +131,100 @@ def cat_key(category: str) -> str:
     return norm(str(category)).replace(" ", "_").replace("/", "_").replace("-", "_")
 
 
-# ══════════ HOW A MODEL CHANGE IS TESTED (static reference) ══════════
-# Rendered below the plans. Computes nothing — the offline numbers come from
-# scripts/train.py, the kitchen numbers from service data the app never sees.
-# Order is the argument: offline is the GATE, live is the VERDICT.
-_EVAL_STAGES = (
-    ("chip-purple", "1 · Offline (test set)", "compare model versions", (
-        "RMSE — vs the ~0.012 baseline",
-        "MAE",
-        "MAPE (% error)",
-        "bias (over / under)",
-        "per-segment RMSE",
-        "**beat the baseline?**",
-    )),
-    ("chip-blue", "2 · Shadow / pilot", "predict vs consumed", (
-        "run alongside the kitchen, don't act on it yet",
-        "would-be waste %",
-        "would-be shortages",
-        "**safe real-world check**",
-    )),
-    ("chip-amber", "3 · Live (production)", "the real scorecard", (
-        "food waste %",
-        "stockout / shortage %",
-        "cost impact (₹)",
-        "override rate",
-        "**is it trusted + saving?**",
-    )),
-)
-
-_EVAL_OFFLINE_TABLE = """
-| Metric | What it is | Why it's here |
-|---|---|---|
-| **RMSE** | root mean squared error, kg/person | the primary yardstick — beat ~0.012. Punishes big misses hardest |
-| **MAE** | mean absolute error, kg/person | robust to outliers. The RMSE−MAE gap tells you how much a few big misses are inflating RMSE — report both |
-| **MAPE** | mean absolute % error | scale-aware, and for portioning often the honest one: 0.02 kg off a 0.05 kg dish is a 40% miss, the same 0.02 off a 0.5 kg dish is 4%. RMSE treats those identically |
-| **Bias** | `mean(predicted − actual)`, signed | the one people forget. Positive = systematic over-prediction (steady waste); negative = under (running out). RMSE squares the sign away |
-| **Per-segment** | the above, split by category / weekday / veg vs non-veg / seen vs fallback item | never trust one global number — a model that improves overall but gets worse on biryani is a net operational loss |
-"""
-
-_EVAL_LIVE_TABLE = """
-| Metric | Where it comes from | Why it's the verdict |
-|---|---|---|
-| **Food waste %** | `(cooked − consumed) / cooked` | the headline business metric. Great RMSE with high waste is a failing model |
-| **Stockout / shortage rate** | how often a dish ran out before service ended | the other failure mode, and it's **asymmetric** — running out usually costs more than a little waste, so you may want the model to over-predict slightly rather than minimise RMSE symmetrically |
-| **Cost impact (₹)** | waste cost + shortage cost, before vs after | the number leadership cares about, and what ultimately justifies the model |
-| **Override rate** | how often the kitchen manager edits the suggested quantity | trust. Override 60% of the time and the model isn't right, whatever the RMSE says |
-"""
+# ══════════ MODEL SCORECARD ══════════
+# What the model actually scores on the days training held out — the numbers to
+# watch while tuning EPOCHS / EMB_DIMS / encoder_columns. Scoring reads the
+# dataset and runs the model, a few seconds, so it sits behind a checkbox rather
+# than running on every rerender; the result is cached per (client, model file),
+# so retraining invalidates it and nothing else does.
+# Numbered because st.bar_chart sorts its x axis alphabetically — without the
+# prefix the week reads friday, monday, thursday, tuesday, wednesday.
+_WEEKDAY_LABELS = {
+    "monday": "1 Mon", "tuesday": "2 Tue", "wednesday": "3 Wed", "thursday": "4 Thu",
+    "friday": "5 Fri", "saturday": "6 Sat", "sunday": "7 Sun",
+}
 
 
-def _render_evaluation_reference():
-    """The testing framework, below the plans — offline gate, kitchen verdict."""
-    with st.expander("🧪  How a model change is tested — offline metrics vs the real scorecard"):
-        for stage_col, (chip, title, subtitle, lines) in zip(st.columns(3), _EVAL_STAGES):
-            stage_col.markdown(f'<span class="chip {chip}">{title}</span>', unsafe_allow_html=True)
-            stage_col.caption(subtitle)
-            stage_col.markdown("\n".join(f"- {line}" for line in lines))
+@st.cache_data(show_spinner=False)
+def _scorecard_frame(ck, dataset_path, _model_mtime):
+    """One row per held-out item. _model_mtime is a cache key, not an argument."""
+    return evaluate_model(ck, dataset_path, get_logic(ck))
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("**Part 1 — ML metrics** · computed on the held-out test set, every time the model changes")
-        st.markdown(_EVAL_OFFLINE_TABLE)
-        st.markdown("**Part 2 — real-world metrics** · predicted vs actually consumed, once a plan is in use")
-        st.markdown(_EVAL_LIVE_TABLE)
 
-        st.info(
-            "**The rule for every change:** it must beat the baseline offline "
-            "(RMSE / MAPE) **and** not worsen bias, shortages or waste in the shadow "
-            "or live check. Theory is the gate; waste, shortage and cost are the verdict. "
-            "A model can be unbiased on average and still under-predict curries — "
-            "shortages on exactly the dishes people wanted."
-        )
+def _rmse(errors):
+    return float((errors ** 2).mean() ** 0.5)
+
+
+def _render_model_scorecard():
+    with st.expander("📊  Model scorecard — measured on the days training held out"):
         st.caption(
-            "Same scorecard for the planner's business math: the bumps and vendor floors "
-            "are tuned by these numbers too — Tekion's `vendor_floor_ratio` of 0.825 exists "
-            "precisely to trade a little waste for fewer shortages."
+            "Offline metrics for the artifacts currently deployed. Retrain "
+            "(`python scripts/train.py --client all --force`) and these move."
         )
+        if not st.checkbox(
+            "Measure now", key=key("scorecard_on"),
+            help="Reads this client's dataset and runs the saved model over its held-out days.",
+        ):
+            return
+
+        try:
+            with st.spinner("Scoring the saved model…"):
+                frame = _scorecard_frame(
+                    CLIENT_KEY, CLIENT_INFO["dataset"], model_mtime(CLIENT_KEY),
+                )
+            card = scorecard(frame)
+        except Exception as exc:                      # a monitoring panel must never cost a plan
+            st.error(f"Could not score this model: {exc}")
+            return
+
+        rmse_col, mae_col, mape_col, bias_col, rows_col = st.columns(5)
+        rmse_col.metric(
+            "RMSE", f"{card['rmse']:.4f}",
+            delta=f"{card['rmse'] - BASELINE_RMSE:+.4f} vs {BASELINE_RMSE} baseline",
+            delta_color="inverse",                    # lower is better
+        )
+        mae_col.metric("MAE", f"{card['mae']:.4f}", help="kg/person. Robust to outliers — "
+                       "the gap to RMSE is how much a few big misses are inflating it.")
+        mape_col.metric("MAPE", f"{card['mape']:.1f}%",
+                        help=f"Scale-aware. Over the {card['mape_rows']} of {card['rows']} "
+                             "rows whose actual is above zero.")
+        bias_col.metric(
+            "Bias", f"{card['bias']:+.4f}",
+            delta="over-predicting" if card["bias"] > 0 else "under-predicting",
+            delta_color="off",
+            help="Signed mean error — the one RMSE hides. Positive means steady waste, "
+                 "negative means running out.",
+        )
+        rows_col.metric("Test rows", f"{card['rows']:,}")
+
+        scatter_col, category_col = st.columns(2)
+        with scatter_col:
+            st.markdown("**Predicted vs actual** — the tighter to the diagonal, the better")
+            st.scatter_chart(
+                frame.assign(perfect=frame["actual"]),
+                x="actual", y=["predicted", "perfect"], height=280,
+            )
+        with category_col:
+            st.markdown("**RMSE by category** — where the model is worst")
+            st.bar_chart(
+                frame.groupby("category")["error"].apply(_rmse).sort_values(ascending=False),
+                height=280, color="#4f8ef7",
+            )
+
+        weekday_col, worst_col = st.columns(2)
+        with weekday_col:
+            st.markdown("**Bias by weekday** — above zero is waste, below is shortage")
+            by_weekday = frame.assign(
+                day=frame["weekday"].map(_WEEKDAY_LABELS)
+            ).groupby("day")["error"].mean()
+            st.bar_chart(by_weekday, height=280, color="#a78bfa")
+        with worst_col:
+            st.markdown("**Worst 10 items** — biggest absolute misses")
+            st.dataframe(
+                frame.nlargest(10, "abs_error")[["item", "actual", "predicted", "error"]]
+                     .round(4),
+                use_container_width=True, hide_index=True, height=280,
+            )
 
 
 # ═══════════════════════════════════════════════════════
@@ -672,7 +693,7 @@ def _render_production_plan_tab():
                 )
                 st.markdown("<br>", unsafe_allow_html=True)
 
-    _render_evaluation_reference()
+    _render_model_scorecard()
 
     # ── SPECIAL DAY (independent button) ────────────────────────────────
     # Deliberately outside the Predict block: ops want the reduced MG figure

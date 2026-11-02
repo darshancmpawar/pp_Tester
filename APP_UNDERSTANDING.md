@@ -43,6 +43,8 @@ Model training + inference:
 - encoder/map artifact generation
 - fallback inference for unseen items
 - client-prefixed artifact loading
+- `evaluate_model` / `scorecard`: score the saved model on its held-out dates
+  (no retrain, no writes) — what the UI scorecard renders
 
 ## `planner.py`
 Operational math layer:
@@ -244,10 +246,15 @@ Before training:
 ## Current UI Behavior Notes
 
 - Special Day button is independent from Predict button.
-- An evaluation-reference expander sits below the plans: the offline ML metrics
-  (RMSE / MAE / MAPE / bias / per-segment) that gate a model change, and the
-  real-world scorecard (waste %, shortage %, cost, override rate) that is the
-  verdict. Static text — it computes nothing.
+- A **Model scorecard** expander sits below the plans. Behind a "Measure now"
+  checkbox (scoring costs a few seconds, then caches) it runs the saved model
+  over the days training held out and shows RMSE vs the 0.012 baseline, MAE,
+  MAPE, signed bias and test-row count, plus four views: predicted-vs-actual,
+  RMSE by category, bias by weekday, and the ten worst misses. These are the
+  numbers to watch while tuning `EPOCHS` / `EMB_DIMS` / `encoder_columns`.
+  Measured, not printed — `ml_core.evaluate_model` + `ml_core.scorecard`.
+  The live half (waste %, shortage rate, override rate) is absent because the
+  app never receives consumed-vs-cooked data.
 - Non-veg behavior supports:
   - toggle clients
   - no-toggle clients with forced non-veg section
@@ -291,6 +298,7 @@ Every operational constant is documented beside its definition. Index:
 | Model size / training length | `ml_core.py` | `EPOCHS`, `BATCH`, `EMB_DIMS`, `CTX_LEN` |
 | Output rounding grids (5 heads / 5 g) | `planner.py`, `ml_core.py` | `round_to_nearest_5`, `floor005` |
 | Concurrent prediction limit | `concurrency.py` | `MAX_CONCURRENT_PREDICTS` |
+| RMSE a retrain must beat | `ml_core.py` | `BASELINE_RMSE` |
 
 Changing anything in `encoder_columns` or `EMB_DIMS` requires a retrain:
 `python scripts/train.py --client all --force`.

@@ -231,8 +231,9 @@ def get_nv_cats(ck, path, logic):
 
 # ── Model training ────────────────────────────────────────────────────────────
 
-def train_model(ck, path, logic, verbose=0):
-    np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
+def _prepare_frame(ck, path, logic):
+    """Dataset → validated, canonicalised frame. Shared by training and scoring,
+    so a model is always measured over exactly the rows it was trained on."""
     df = load_dataset(ck, path, logic)
 
     # ── Schema validation ─────────────────────────────────────────────────────
@@ -280,6 +281,68 @@ def train_model(ck, path, logic, verbose=0):
     for col in logic.encoder_columns:
         if col not in df.columns and col in autofill_defaults:
             df[col] = autofill_defaults[col]
+    return df
+
+
+def _co_menu_ctx(df, item_classes):
+    """Per row: the embedding indices of the OTHER items served on that date.
+
+    This "co-menu context" lets the model learn that a dish's per-pax shifts
+    depending on what else is on the menu — rice drops when noodles are served.
+    Truncated to CTX_LEN and right-padded with pad_idx = len(vocab), the OOV
+    slot inside the Embedding layer (hence vocab+1 in the layer definition).
+    """
+    item_to_idx   = {item: idx for idx, item in enumerate(item_classes)}
+    pad_idx       = len(item_to_idx)
+    items_by_date = df.groupby("date")["menu_items"].apply(list)
+
+    def row_ctx(row):
+        other = [
+            item_to_idx[it]
+            for it in items_by_date[row["date"]]
+            if it in item_to_idx and it != row["menu_items"]
+        ][:CTX_LEN]
+        return other + [pad_idx] * (CTX_LEN - len(other))
+
+    return df[["date", "menu_items"]].apply(row_ctx, axis=1)
+
+
+def _test_mask(df):
+    """Boolean mask of the held-out TEST rows.
+
+    Split by unique service DATE, not by row: every item on a day shares one
+    co-menu context vector, so a row-level split would let context items see
+    their own test labels — direct leakage. Seeded, so training and a later
+    scoring run hold out the same days.
+    """
+    rng          = np.random.RandomState(SEED)
+    date_groups  = df["date"].dt.normalize().astype("string").fillna("nat")
+    unique_dates = date_groups.unique().tolist()
+
+    if len(unique_dates) >= 2:
+        dates = np.array(unique_dates, dtype=object)
+        rng.shuffle(dates)
+        n_test = max(1, int(round(len(dates) * TEST_SIZE)))
+        if n_test >= len(dates):
+            n_test = len(dates) - 1       # always keep at least one train date
+        mask = date_groups.isin(set(dates[:n_test])).to_numpy()
+        if mask.any() and not mask.all():
+            return mask
+        # Degenerate (e.g. every row on one date) — fall through to a row split.
+
+    idx = np.arange(len(df))
+    rng.shuffle(idx)
+    cut = max(1, int(round(len(idx) * (1 - TEST_SIZE))))
+    if cut >= len(idx):
+        cut = len(idx) - 1
+    mask = np.zeros(len(df), dtype=bool)
+    mask[idx[cut:]] = True
+    return mask
+
+
+def train_model(ck, path, logic, verbose=0):
+    np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
+    df = _prepare_frame(ck, path, logic)
 
     # ── Build item lookup maps ────────────────────────────────────────────────
     # These dicts map item name → sub-category / category. They are saved as
@@ -306,29 +369,7 @@ def train_model(ck, path, logic, verbose=0):
         joblib.dump(le, _ap(ck, f"{col}_encoder.pkl"))
         encoders[col] = le
 
-    # ── Build co-menu context vectors ─────────────────────────────────────────
-    # For each row, record the embedding indices of all OTHER items served on
-    # the same date. This "co-menu context" lets the model learn that a dish's
-    # per-pax shifts depending on what else is on the menu — e.g. rice quantity
-    # drops when noodles are also served that day.
-    #
-    # Sequences are truncated to CTX_LEN and right-padded with pad_idx.
-    # pad_idx = vocab_size (one beyond the last real item) is the OOV slot
-    # inside the Keras Embedding layer (hence vocab+1 in the layer definition).
-    item_to_idx  = {item: idx for idx, item in enumerate(encoders["menu_items"].classes_)}
-    pad_idx      = len(item_to_idx)
-    items_by_date = df.groupby("date")["menu_items"].apply(list)
-
-    def _build_co_menu_ctx(row):
-        other_indices = [
-            item_to_idx[it]
-            for it in items_by_date[row["date"]]
-            if it in item_to_idx and it != row["menu_items"]
-        ]
-        truncated = other_indices[:CTX_LEN]
-        return truncated + [pad_idx] * (CTX_LEN - len(truncated))
-
-    df["co_menu_ctx"] = df[["date", "menu_items"]].apply(_build_co_menu_ctx, axis=1)
+    df["co_menu_ctx"] = _co_menu_ctx(df, encoders["menu_items"].classes_)
 
     # ── Assemble input arrays for Keras ───────────────────────────────────────
     # feature_cols = every encoder column except menu_items (handled separately).
@@ -341,54 +382,11 @@ def train_model(ck, path, logic, verbose=0):
     )
     y = np.array(df["ideal_pp"], dtype=float)
 
-    # ── Date-grouped train / test split ───────────────────────────────────────
-    # Split by unique service date rather than by individual row. All items on
-    # the same day share the same co-menu context vector, so a row-level split
-    # would let context items "see" their own test labels — direct data leakage.
-    date_groups  = df["date"].dt.normalize().astype("string").fillna("nat")
-    unique_dates = date_groups.unique().tolist()
-
-    if len(unique_dates) >= 2:
-        rng = np.random.RandomState(SEED)
-        unique_dates = np.array(unique_dates, dtype=object)
-        rng.shuffle(unique_dates)
-
-        n_test_dates = max(1, int(round(len(unique_dates) * TEST_SIZE)))
-        if n_test_dates >= len(unique_dates):
-            n_test_dates = len(unique_dates) - 1  # always keep at least one train date
-
-        test_dates = set(unique_dates[:n_test_dates])
-        test_mask  = date_groups.isin(test_dates).to_numpy()
-        train_mask = ~test_mask
-
-        if train_mask.sum() == 0 or test_mask.sum() == 0:
-            # Degenerate date split (e.g. all rows on the same date) — fall back
-            # to a plain row-level shuffle so training can still proceed.
-            idx = np.arange(len(df))
-            rng.shuffle(idx)
-            cut = max(1, int(round(len(idx) * (1 - TEST_SIZE))))
-            if cut >= len(idx):
-                cut = len(idx) - 1
-            train_idx, test_idx = idx[:cut], idx[cut:]
-            X_train = [arr[train_idx] for arr in X]
-            X_test  = [arr[test_idx]  for arr in X]
-            y_train, y_test = y[train_idx], y[test_idx]
-        else:
-            X_train = [arr[train_mask] for arr in X]
-            X_test  = [arr[test_mask]  for arr in X]
-            y_train, y_test = y[train_mask], y[test_mask]
-    else:
-        # Single-date dataset — row-level shuffle only option.
-        idx = np.arange(len(df))
-        rng = np.random.RandomState(SEED)
-        rng.shuffle(idx)
-        cut = max(1, int(round(len(idx) * (1 - TEST_SIZE))))
-        if cut >= len(idx):
-            cut = len(idx) - 1
-        train_idx, test_idx = idx[:cut], idx[cut:]
-        X_train = [arr[train_idx] for arr in X]
-        X_test  = [arr[test_idx]  for arr in X]
-        y_train, y_test = y[train_idx], y[test_idx]
+    test_mask  = _test_mask(df)
+    train_mask = ~test_mask
+    X_train = [arr[train_mask] for arr in X]
+    X_test  = [arr[test_mask]  for arr in X]
+    y_train, y_test = y[train_mask], y[test_mask]
 
     if len(y_train) == 0 or len(y_test) == 0:
         raise ValueError(
@@ -462,6 +460,88 @@ def train_model(ck, path, logic, verbose=0):
     rmse  = float(np.sqrt(mean_squared_error(y_test, preds)))
     model.save(_ap(ck, "per_pax_tf_model.keras"))
     return model, rmse
+
+
+# ── Scoring a trained model ───────────────────────────────────────────────────
+# What the UI's scorecard is built from. evaluate_model needs TensorFlow (it
+# runs the model); scorecard() is pure arithmetic over its output, so it is the
+# half that is unit-tested.
+
+BASELINE_RMSE = 0.012   # the yardstick a retrain has to beat, in kg/person
+
+
+def model_mtime(ck):
+    """Last-modified time of this client's saved model — the UI's cache key."""
+    return os.path.getmtime(_ap(ck, "per_pax_tf_model.keras"))
+
+
+def evaluate_model(ck, path, logic):
+    """Score the SAVED model on the same days train_model held out.
+
+    Reads nothing but the dataset and the committed artifacts, writes nothing,
+    retrains nothing — safe to call from the UI. Returns one row per held-out
+    item: item, category, weekday, actual, predicted, error, abs_error.
+
+    Predictions are the model's RAW output, deliberately not passed through
+    floor005(): this number is compared against the RMSE train.py prints, and
+    rounding to the 5 g grid would make the two incomparable.
+    """
+    df       = _prepare_frame(ck, path, logic)
+    encoders = {c: load_enc(ck, c) for c in logic.encoder_columns}
+
+    for col in logic.encoder_columns:
+        enc = encoders[col]
+        df[f"{col}_idx"] = [encode_safe(enc, v) for v in df[col]]
+    df["co_menu_ctx"] = _co_menu_ctx(df, encoders["menu_items"].classes_)
+
+    test = df[_test_mask(df)]
+    if test.empty:
+        raise ValueError(f"[{ck}] the held-out split is empty — nothing to score.")
+
+    feature_cols = [c for c in logic.encoder_columns if c != "menu_items"]
+    X = (
+        [np.array(test["menu_items_idx"]), np.array(test["co_menu_ctx"].tolist())]
+        + [np.array(test[f"{c}_idx"]) for c in feature_cols]
+    )
+    predicted = load_model(ck).predict(X, verbose=0).flatten()
+
+    out = pd.DataFrame({
+        "item":      test["menu_items"].to_numpy(),
+        "category":  test["category"].to_numpy(),
+        "weekday":   test["weekday"].to_numpy(),
+        "actual":    test["ideal_pp"].to_numpy(dtype=float),
+        "predicted": predicted.astype(float),
+    })
+    out["error"]     = out["predicted"] - out["actual"]   # signed: + is over-prediction
+    out["abs_error"] = out["error"].abs()
+    return out
+
+
+def scorecard(eval_df):
+    """The headline numbers over an evaluate_model frame.
+
+    bias is SIGNED and is the one RMSE hides: positive means the model
+    systematically over-predicts (steady waste), negative means it under-
+    predicts (running out). MAPE skips rows whose actual is 0 — the division
+    is undefined there, and silently treating them as 0% flatters the model —
+    so mape_rows reports how many rows it actually covers.
+    """
+    n = len(eval_df)
+    if n == 0:
+        raise ValueError("nothing to score — the evaluation frame is empty.")
+
+    err     = eval_df["error"]
+    scored  = eval_df[eval_df["actual"] > 0]
+    mape    = float((scored["abs_error"] / scored["actual"]).mean() * 100) if len(scored) else float("nan")
+
+    return {
+        "rows":      n,
+        "rmse":      float(np.sqrt((err ** 2).mean())),
+        "mae":       float(err.abs().mean()),
+        "mape":      mape,
+        "mape_rows": len(scored),
+        "bias":      float(err.mean()),
+    }
 
 
 # ── Prediction ────────────────────────────────────────────────────────────────
