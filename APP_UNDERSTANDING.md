@@ -244,6 +244,10 @@ Before training:
 ## Current UI Behavior Notes
 
 - Special Day button is independent from Predict button.
+- An evaluation-reference expander sits below the plans: the offline ML metrics
+  (RMSE / MAE / MAPE / bias / per-segment) that gate a model change, and the
+  real-world scorecard (waste %, shortage %, cost, override rate) that is the
+  verdict. Static text — it computes nothing.
 - Non-veg behavior supports:
   - toggle clients
   - no-toggle clients with forced non-veg section

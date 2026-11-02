@@ -10,6 +10,7 @@ Reading order (top to bottom matches the on-screen order):
        c. inputs:  date/context → non-veg items → shared MG → menu items
        d. Predict → per-item prediction → client / vendor / aggressive plans
        e. Special Day button (independent of Predict)
+       f. evaluation reference expander (static; how a model change is judged)
 
 Three objects drive everything and are read-only after the selector:
   CLIENT_KEY   lowercase id, e.g. "tekion" — prefixes artifacts and widget keys
@@ -127,6 +128,82 @@ def key(name: str) -> str:
 def cat_key(category: str) -> str:
     """Turn a category name into a widget-key-safe slug ('Sambar/Rasam' → 'sambar_rasam')."""
     return norm(str(category)).replace(" ", "_").replace("/", "_").replace("-", "_")
+
+
+# ══════════ HOW A MODEL CHANGE IS TESTED (static reference) ══════════
+# Rendered below the plans. Computes nothing — the offline numbers come from
+# scripts/train.py, the kitchen numbers from service data the app never sees.
+# Order is the argument: offline is the GATE, live is the VERDICT.
+_EVAL_STAGES = (
+    ("chip-purple", "1 · Offline (test set)", "compare model versions", (
+        "RMSE — vs the ~0.012 baseline",
+        "MAE",
+        "MAPE (% error)",
+        "bias (over / under)",
+        "per-segment RMSE",
+        "**beat the baseline?**",
+    )),
+    ("chip-blue", "2 · Shadow / pilot", "predict vs consumed", (
+        "run alongside the kitchen, don't act on it yet",
+        "would-be waste %",
+        "would-be shortages",
+        "**safe real-world check**",
+    )),
+    ("chip-amber", "3 · Live (production)", "the real scorecard", (
+        "food waste %",
+        "stockout / shortage %",
+        "cost impact (₹)",
+        "override rate",
+        "**is it trusted + saving?**",
+    )),
+)
+
+_EVAL_OFFLINE_TABLE = """
+| Metric | What it is | Why it's here |
+|---|---|---|
+| **RMSE** | root mean squared error, kg/person | the primary yardstick — beat ~0.012. Punishes big misses hardest |
+| **MAE** | mean absolute error, kg/person | robust to outliers. The RMSE−MAE gap tells you how much a few big misses are inflating RMSE — report both |
+| **MAPE** | mean absolute % error | scale-aware, and for portioning often the honest one: 0.02 kg off a 0.05 kg dish is a 40% miss, the same 0.02 off a 0.5 kg dish is 4%. RMSE treats those identically |
+| **Bias** | `mean(predicted − actual)`, signed | the one people forget. Positive = systematic over-prediction (steady waste); negative = under (running out). RMSE squares the sign away |
+| **Per-segment** | the above, split by category / weekday / veg vs non-veg / seen vs fallback item | never trust one global number — a model that improves overall but gets worse on biryani is a net operational loss |
+"""
+
+_EVAL_LIVE_TABLE = """
+| Metric | Where it comes from | Why it's the verdict |
+|---|---|---|
+| **Food waste %** | `(cooked − consumed) / cooked` | the headline business metric. Great RMSE with high waste is a failing model |
+| **Stockout / shortage rate** | how often a dish ran out before service ended | the other failure mode, and it's **asymmetric** — running out usually costs more than a little waste, so you may want the model to over-predict slightly rather than minimise RMSE symmetrically |
+| **Cost impact (₹)** | waste cost + shortage cost, before vs after | the number leadership cares about, and what ultimately justifies the model |
+| **Override rate** | how often the kitchen manager edits the suggested quantity | trust. Override 60% of the time and the model isn't right, whatever the RMSE says |
+"""
+
+
+def _render_evaluation_reference():
+    """The testing framework, below the plans — offline gate, kitchen verdict."""
+    with st.expander("🧪  How a model change is tested — offline metrics vs the real scorecard"):
+        for stage_col, (chip, title, subtitle, lines) in zip(st.columns(3), _EVAL_STAGES):
+            stage_col.markdown(f'<span class="chip {chip}">{title}</span>', unsafe_allow_html=True)
+            stage_col.caption(subtitle)
+            stage_col.markdown("\n".join(f"- {line}" for line in lines))
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("**Part 1 — ML metrics** · computed on the held-out test set, every time the model changes")
+        st.markdown(_EVAL_OFFLINE_TABLE)
+        st.markdown("**Part 2 — real-world metrics** · predicted vs actually consumed, once a plan is in use")
+        st.markdown(_EVAL_LIVE_TABLE)
+
+        st.info(
+            "**The rule for every change:** it must beat the baseline offline "
+            "(RMSE / MAPE) **and** not worsen bias, shortages or waste in the shadow "
+            "or live check. Theory is the gate; waste, shortage and cost are the verdict. "
+            "A model can be unbiased on average and still under-predict curries — "
+            "shortages on exactly the dishes people wanted."
+        )
+        st.caption(
+            "Same scorecard for the planner's business math: the bumps and vendor floors "
+            "are tuned by these numbers too — Tekion's `vendor_floor_ratio` of 0.825 exists "
+            "precisely to trade a little waste for fewer shortages."
+        )
 
 
 # ═══════════════════════════════════════════════════════
@@ -594,6 +671,8 @@ def _render_production_plan_tab():
                     use_container_width=True, hide_index=True,
                 )
                 st.markdown("<br>", unsafe_allow_html=True)
+
+    _render_evaluation_reference()
 
     # ── SPECIAL DAY (independent button) ────────────────────────────────
     # Deliberately outside the Predict block: ops want the reduced MG figure
