@@ -26,6 +26,9 @@
 
 /* ── RESET / GLOBAL ── */
 *, *::before, *::after { font-family:'Inter',sans-serif !important; box-sizing:border-box; }
+/* ...except Streamlit's icon glyphs: the blanket !important above made the
+   expander chevron paint as the literal text 'keyboard_arrow_right'. */
+[data-testid="stIconMaterial"] { font-family:'Material Symbols Rounded' !important; }
 
 /* ── APP SHELL ── */
 .stApp,
@@ -40,6 +43,11 @@
 /* ── TYPOGRAPHY ── */
 h1,h2,h3,h4 { color:var(--text) !important; font-weight:600 !important; letter-spacing:-.02em !important; }
 p,[data-testid="stMarkdownContainer"] p { color:var(--tsec) !important; line-height:1.6 !important; }
+/* Lists and markdown tables inherit Streamlit's LIGHT-theme #31333F otherwise —
+   1.5:1 on this background. The app ships no config.toml, so set them here. */
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] td { color:var(--tsec) !important; line-height:1.6 !important; }
+[data-testid="stMarkdownContainer"] th { color:var(--text) !important; }
 label { color:var(--tsec) !important; font-size:.8rem !important; font-weight:500 !important; letter-spacing:.015em !important; }
 
 /* ── ALL FORM INPUTS (shared base) ── */
