@@ -284,7 +284,8 @@ Every operational constant is documented beside its definition. Index:
 | Stripe weekday MG drops | `client_logic.py` | `day_reductions` |
 | Fixed salad portion | `client_logic.py` | `salad_per_pax` |
 | Contracted billing portions | `client_logic.py` | `fixed_pp_map` |
-| Model size / training length | `ml_core.py` | `EPOCHS`, `BATCH`, `EMB_DIMS`, `CTX_LEN` |
+| Per-client epochs, batch, learning rate, head size, dropout | `model_params.json` (written by `scripts/tune.py`) | per client key |
+| Shared embedding widths / context length | `ml_core.py` | `EMB_DIMS`, `CTX_LEN`, `DEFAULT_PARAMS` |
 | Output rounding grids (5 heads / 5 g) | `planner.py`, `ml_core.py` | `round_to_nearest_5`, `floor005` |
 | Concurrent prediction limit | `concurrency.py` | `MAX_CONCURRENT_PREDICTS` |
 
