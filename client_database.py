@@ -6,14 +6,15 @@ has_embeddings=False means multiplier-only (like Toasttab).
 """
 import os
 DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.join(DIR, "data")   # client training datasets (.xlsx)
 
 CLIENT_DB = {
-    "tekion":   {"name":"Tekion",   "dataset":os.path.join(DIR,"Tekion_dataset.xlsx"),            "has_embeddings":True},
-    "clario":   {"name":"Clario",   "dataset":os.path.join(DIR,"Clario_Wastage_dataset.xlsx"),    "has_embeddings":True, "sheet":"Sheet1"},
-    "odessia":  {"name":"Odessia",  "dataset":os.path.join(DIR,"Odessia Dataset.xlsx"),           "has_embeddings":True},
-    "rippling": {"name":"Rippling", "dataset":os.path.join(DIR,"Rippling_Dataset.xlsx"),          "has_embeddings":True},
-    "stripe":   {"name":"Stripe",   "dataset":os.path.join(DIR,"Stripe_Dataset.xlsx"),            "has_embeddings":True},
-    "tessolve": {"name":"Tessolve", "dataset":os.path.join(DIR,"Tesslove_Wastage_Dataset.xlsx"),  "has_embeddings":True},
+    "tekion":   {"name":"Tekion",   "dataset":os.path.join(DATA_DIR,"Tekion_dataset.xlsx"),            "has_embeddings":True},
+    "clario":   {"name":"Clario",   "dataset":os.path.join(DATA_DIR,"Clario_Wastage_dataset.xlsx"),    "has_embeddings":True, "sheet":"Sheet1"},
+    "odessia":  {"name":"Odessia",  "dataset":os.path.join(DATA_DIR,"Odessia Dataset.xlsx"),           "has_embeddings":True},
+    "rippling": {"name":"Rippling", "dataset":os.path.join(DATA_DIR,"Rippling_Dataset.xlsx"),          "has_embeddings":True},
+    "stripe":   {"name":"Stripe",   "dataset":os.path.join(DATA_DIR,"Stripe_Dataset.xlsx"),            "has_embeddings":True},
+    "tessolve": {"name":"Tessolve", "dataset":os.path.join(DATA_DIR,"Tesslove_Wastage_Dataset.xlsx"),  "has_embeddings":True},
     "toasttab": {"name":"Toasttab", "dataset":None, "has_embeddings":False},
 }
 

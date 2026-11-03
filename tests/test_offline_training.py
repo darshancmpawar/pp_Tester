@@ -94,7 +94,7 @@ class TestTrainScript:
         assert rc is False
         assert "dataset missing" in capsys.readouterr().out
 
-    def test_skips_when_artifacts_present(self, train_mod, monkeypatch, tmp_path, capsys):
+    def test_skips_when_up_to_date(self, train_mod, monkeypatch, tmp_path, capsys):
         ds = tmp_path / "fake.xlsx"
         ds.write_bytes(b"")
         _stub_db(monkeypatch, train_mod, {
@@ -105,11 +105,31 @@ class TestTrainScript:
         monkeypatch.setattr(train_mod, "train_model",
                             lambda *a, **kw: called.append(a) or (None, 0.0))
         monkeypatch.setattr(train_mod, "artifacts_exist", lambda *a, **kw: True)
+        monkeypatch.setattr(train_mod, "stale_reasons", lambda *a, **kw: [])
 
         rc = train_mod.train_one("tekion", train_mod.CLIENT_DB["tekion"])
         assert rc is True
-        assert called == [], "train_model should be skipped when artifacts present"
-        assert "artifacts already present" in capsys.readouterr().out
+        assert called == [], "train_model should be skipped when the model is up to date"
+        assert "up to date" in capsys.readouterr().out
+
+    def test_retrains_when_stale(self, train_mod, monkeypatch, tmp_path, capsys):
+        """A settings / dataset / test-day change retrains without --force and logs why."""
+        ds = tmp_path / "fake.xlsx"
+        ds.write_bytes(b"")
+        _stub_db(monkeypatch, train_mod, {
+            "tekion": {"name": "Tekion", "dataset": str(ds), "has_embeddings": True},
+        })
+        _patch_logic(monkeypatch, train_mod)
+        notes = []
+        monkeypatch.setattr(train_mod, "train_model",
+                            lambda *a, **kw: notes.append(kw.get("note")) or (None, 0.05))
+        monkeypatch.setattr(train_mod, "artifacts_exist", lambda *a, **kw: True)
+        monkeypatch.setattr(train_mod, "stale_reasons", lambda *a, **kw: ["epochs 5→8"])
+
+        rc = train_mod.train_one("tekion", train_mod.CLIENT_DB["tekion"], note="try more epochs")
+        assert rc is True
+        assert notes == ["try more epochs; auto-retrain: epochs 5→8"]
+        assert "[stale] tekion: epochs 5→8" in capsys.readouterr().out
 
     def test_force_retrains_even_if_present(self, train_mod, monkeypatch, tmp_path, capsys):
         ds = tmp_path / "fake.xlsx"
@@ -248,7 +268,7 @@ class TestLoadDatasetSheetSelection:
 class TestAppDoesNotTrain:
     def test_app_imports_no_training_symbols(self):
         """Sanity: app.py must not import train_model, train_gate, or clear_cache."""
-        src = open("app.py").read()
+        src = open("app.py", encoding="utf-8").read()
         assert "train_model" not in src, "app.py should not reference train_model"
         assert "train_gate" not in src, "app.py should not reference train_gate"
         assert "clear_cache" not in src, "app.py should not reference clear_cache"

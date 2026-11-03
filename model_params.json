@@ -1,0 +1,25 @@
+{
+  "clario": {
+    "epochs": 5,
+    "batch": 32,
+    "learning_rate": 0.003,
+    "optimizer": "adam",
+    "loss": "mse",
+    "activation": "relu",
+    "item_emb_dim": 4,
+    "dense_units": [
+      32,
+      16
+    ],
+    "dropout": 0.5,
+    "target_mode": "category_offset",
+    "val_split": 0.1,
+    "test_size": 0.2,
+    "_val_rmse": 0.01853,
+    "_default_val_rmse": 0.01943,
+    "_tuned_at": "2026-11-03 16:53",
+    "_trials": 24,
+    "_chosen_at": "2026-11-03 17:43",
+    "_why": "beat the 17:31 re-tune on dataset (2): RMSE 0.0117 vs 0.0121, 15-day accuracy 85.4% vs 83.4%"
+  }
+}

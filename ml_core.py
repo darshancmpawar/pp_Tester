@@ -19,19 +19,128 @@ ARTIFACT_DIR = os.environ.get(
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
 # ═══ TUNING: training hyperparameters ═════════════════════════════════════════
-# These apply to EVERY client — there is one architecture, shaped per client by
-# its encoder_columns. The datasets are small (a few thousand rows each), which
-# is what every value below is sized for. Change one, then retrain all clients
-# (`python scripts/train.py --client all --force`) and compare the printed RMSE;
-# a typical per-pax RMSE is a few hundredths of a kg.
+# There is one architecture, shaped per client by its encoder_columns. The
+# constants in this block are shared by every client (changing them changes the
+# data pipeline or the test split). The per-client knobs — epochs, batch size,
+# learning rate, head size, dropout, item embedding width — live in
+# model_params.json, written by `python scripts/tune.py`. A client missing
+# from that file trains with DEFAULT_PARAMS. After editing it, run
+# `python scripts/train.py`: it retrains exactly the clients whose settings,
+# dataset or test-case days changed since their last training (stale_reasons).
 
 SEED       = 42   # fixed so two runs on the same dataset give the same model
 CTX_LEN    = 10   # max co-menu items kept as context per row. A full menu is
                   # 8–10 dishes, so 10 covers a day without padding waste.
-EPOCHS     = 20   # enough to converge on a few-thousand-row set; more overfits
-BATCH      = 32   # small batches — the datasets are too small for 128+
 VAL_SPLIT  = 0.1  # fraction of TRAINING rows Keras holds out to watch val_loss
 TEST_SIZE  = 0.2  # fraction of DATES held out as the final (reported) test set
+
+# The original shared settings, kept as the fallback for untuned clients.
+DEFAULT_PARAMS = {
+    "epochs":        20,
+    "batch":         32,
+    "learning_rate": 0.001,     # Keras Adam default
+    "optimizer":     "adam",    # adam | adamw | rmsprop | sgd
+    "loss":          "mse",     # mse | mae | huber
+    "activation":    "relu",    # hidden-layer activation: relu | elu | gelu | tanh
+    "item_emb_dim":  8,         # width of the dish + co-menu embeddings
+    "dense_units":   [64, 32],
+    "dropout":       0.3,
+    # raw: the model predicts ideal_pp directly.
+    # category_offset: it predicts ideal_pp minus the category's training-row
+    # mean, which is added back at prediction time. Categories differ by up to
+    # 10× in portion (bread pieces vs rasam kg), so the network only has to
+    # learn the small per-dish/per-day adjustment, not the category's scale.
+    "target_mode":   "raw",
+    "val_split":     VAL_SPLIT,
+    "test_size":     TEST_SIZE,
+}
+PARAMS_FILE = os.path.join(os.path.dirname(__file__), "model_params.json")
+
+# Each client's test-case workbook (test_model.py). Every date on its "cases"
+# sheet is dropped from training, tuning and evaluation data, so the model
+# never sees the days it is tested on.
+TEST_CASES_DIR = os.path.join(os.path.dirname(__file__), "test_cases")
+
+def test_workbook_path(ck):
+    return os.path.join(TEST_CASES_DIR, f"{ck}_test.xlsx")
+
+def holdout_dates(ck):
+    """Normalised dates on the client's test-case sheet (empty set if none)."""
+    path = test_workbook_path(ck)
+    if not os.path.exists(path):
+        return set()
+    dates = pd.to_datetime(pd.read_excel(path, sheet_name="cases")["date"], errors="coerce")
+    return set(dates.dropna().dt.normalize())
+
+PARAM_CHOICES = {
+    "optimizer":   ("adam", "adamw", "rmsprop", "sgd"),
+    "loss":        ("mse", "mae", "huber"),
+    "activation":  ("relu", "elu", "gelu", "tanh"),
+    "target_mode": ("raw", "category_offset"),
+}
+
+def validate_params(params, where):
+    """Raise ValueError naming the bad setting instead of training with a wrong value."""
+    unknown = sorted(k for k in params if not k.startswith("_") and k not in DEFAULT_PARAMS)
+    if unknown:
+        raise ValueError(f"{where}: unknown setting(s) {unknown}. "
+                         f"Valid names: {sorted(DEFAULT_PARAMS)} (prefix notes with '_').")
+    for k, choices in PARAM_CHOICES.items():
+        if k in params and params[k] not in choices:
+            raise ValueError(f"{where}: {k}={params[k]!r} — must be one of {list(choices)}.")
+    for k in ("epochs", "batch", "item_emb_dim"):
+        if k in params and not (isinstance(params[k], int) and params[k] > 0):
+            raise ValueError(f"{where}: {k}={params[k]!r} — must be a whole number above 0.")
+    if "dense_units" in params and not (isinstance(params["dense_units"], list) and len(params["dense_units"]) == 2
+                                        and all(isinstance(u, int) and u > 0 for u in params["dense_units"])):
+        raise ValueError(f"{where}: dense_units={params['dense_units']!r} — must be two whole numbers, e.g. [64, 32].")
+    for k in ("dropout", "val_split", "test_size"):
+        if k in params and not (0 <= params[k] < 1):
+            raise ValueError(f"{where}: {k}={params[k]!r} — must be between 0 and 1.")
+    if "learning_rate" in params and not params["learning_rate"] > 0:
+        raise ValueError(f"{where}: learning_rate={params['learning_rate']!r} — must be above 0.")
+
+def get_params(ck):
+    """DEFAULT_PARAMS overlaid with this client's entry in model_params.json (validated)."""
+    params = dict(DEFAULT_PARAMS)
+    if os.path.exists(PARAMS_FILE):
+        import json
+        with open(PARAMS_FILE, encoding="utf-8") as f:
+            entry = json.load(f).get(ck, {})
+        validate_params(entry, f"model_params.json [{ck}]")
+        params.update({k: v for k, v in entry.items() if k in DEFAULT_PARAMS})
+    return params
+
+def file_sha(path):
+    import hashlib
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:12]
+
+def stale_reasons(ck, dataset_path):
+    """
+    Why the trained model no longer matches its inputs: a list such as
+    ["epochs 5→8", "dataset changed"], or [] when it is up to date. Compares the
+    current settings, dataset file and test-case days with the last row of the
+    client's training log.
+    """
+    import csv, json
+    log_path = _ap(ck, "training_log.csv")
+    if not os.path.exists(log_path):
+        return ["no training log yet"]
+    with open(log_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return ["no training log yet"]
+    last, reasons = rows[-1], []
+    trained = json.loads(last["params"])
+    for k, v in get_params(ck).items():
+        if json.dumps(trained.get(k)) != json.dumps(v):
+            reasons.append(f"{k} {trained.get(k)}→{v}")
+    if last["dataset_sha"] != file_sha(dataset_path):
+        reasons.append("dataset changed")
+    if last.get("holdout", "") != ",".join(sorted(str(d.date()) for d in holdout_dates(ck))):
+        reasons.append("test-case days changed")
+    return reasons
 
 # TUNING: embedding width per feature, in floats. Roughly "how much the model
 # is allowed to memorise about this column". Wider = more capacity and more
@@ -108,6 +217,8 @@ def artifacts_exist(ck, encoder_columns):
 # Streamlit Cloud runs ONE Python process for all user sessions (threads).
 # Loading a Keras model or encoder from disk on every prediction would be
 # too slow. _model_cache holds already-loaded objects keyed by "{ck}:{type}".
+# Each entry remembers the file's modification time, so a retrain while the
+# app is running is picked up on the next prediction — no restart needed.
 #
 # Double-checked locking pattern: the fast path (cache hit) is lock-free.
 # Only a cache miss acquires cache_lock, then re-checks inside the lock to
@@ -116,34 +227,41 @@ from concurrency import cache_lock as _cache_lock
 
 _model_cache = {}
 
-def _load_cached(cache_key, loader_fn):
-    if cache_key in _model_cache:
-        return _model_cache[cache_key]
+def _load_cached(cache_key, path, loader_fn):
+    mtime = os.path.getmtime(path) if os.path.exists(path) else None
+    hit = _model_cache.get(cache_key)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
     with _cache_lock():
-        if cache_key not in _model_cache:
-            _model_cache[cache_key] = loader_fn()
-    return _model_cache[cache_key]
+        hit = _model_cache.get(cache_key)
+        if hit is None or hit[0] != mtime:
+            _model_cache[cache_key] = (mtime, loader_fn())
+    return _model_cache[cache_key][1]
 
 def load_model(ck):
     # TensorFlow Keras model — the heavy artifact, loaded once per client.
-    return _load_cached(
-        f"{ck}:mdl",
-        lambda: tf.keras.models.load_model(_ap(ck, "per_pax_tf_model.keras"))
-    )
+    path = _ap(ck, "per_pax_tf_model.keras")
+    return _load_cached(f"{ck}:mdl", path, lambda: tf.keras.models.load_model(path))
 
 def load_enc(ck, col):
     # LabelEncoder for a single feature column.
-    return _load_cached(
-        f"{ck}:enc:{col}",
-        lambda: joblib.load(_ap(ck, f"{col}_encoder.pkl"))
-    )
+    path = _ap(ck, f"{col}_encoder.pkl")
+    return _load_cached(f"{ck}:enc:{col}", path, lambda: joblib.load(path))
 
 def load_map(ck, name):
     # Lookup dict artifact (item→subcat, item→cat, cat→subs).
-    return _load_cached(
-        f"{ck}:map:{name}",
-        lambda: joblib.load(_ap(ck, f"{name}.pkl"))
-    )
+    path = _ap(ck, f"{name}.pkl")
+    return _load_cached(f"{ck}:map:{name}", path, lambda: joblib.load(path))
+
+def load_offsets(ck):
+    # category → mean ideal_pp, present only for a category_offset model.
+    path = _ap(ck, "cat_offsets.pkl")
+    return _load_cached(f"{ck}:offsets", path,
+                        lambda: joblib.load(path) if os.path.exists(path) else None)
+
+def category_offset(offsets, category):
+    """Training-row mean for this category, or the overall mean if unseen."""
+    return offsets.get(token(category), offsets["__all__"])
 
 
 # ── Safe label encoding ───────────────────────────────────────────────────────
@@ -231,8 +349,13 @@ def get_nv_cats(ck, path, logic):
 
 # ── Model training ────────────────────────────────────────────────────────────
 
-def train_model(ck, path, logic, verbose=0):
-    np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
+def prepare_dataset(ck, path, logic):
+    """
+    Load the client's dataset and apply every validation / cleaning step the
+    model needs (required columns, dates, numeric ideal_pp, weekday, autofilled
+    optional columns). Shared by train_model and test_model.py so evaluation
+    sees exactly the rows training saw.
+    """
     df = load_dataset(ck, path, logic)
 
     # ── Schema validation ─────────────────────────────────────────────────────
@@ -281,30 +404,21 @@ def train_model(ck, path, logic, verbose=0):
         if col not in df.columns and col in autofill_defaults:
             df[col] = autofill_defaults[col]
 
-    # ── Build item lookup maps ────────────────────────────────────────────────
-    # These dicts map item name → sub-category / category. They are saved as
-    # artifacts so the prediction path can resolve sub-cat/cat for any new item
-    # entered at runtime (without re-reading the dataset).
-    item_to_subcat = df.set_index("menu_items")["sub_category"].to_dict()
-    item_to_cat    = df.set_index("menu_items")["category"].to_dict()
-    joblib.dump(item_to_subcat, _ap(ck, "item_to_subcat.pkl"))
-    joblib.dump(item_to_cat,    _ap(ck, "item_to_cat.pkl"))
-    joblib.dump(build_cat_to_subs(item_to_cat, item_to_subcat), _ap(ck, "cat_to_subs.pkl"))
+    # Never train or evaluate on the client's test-case days.
+    holdout = holdout_dates(ck)
+    if holdout:
+        df = df[~df["date"].dt.normalize().isin(holdout)].reset_index(drop=True)
+    return df
 
-    # ── Fit label encoders ────────────────────────────────────────────────────
-    # One sklearn LabelEncoder per feature column converts string tokens to
-    # integer indices consumed by the Keras Embedding layers.
-    # An "other" token is always appended so the encoder has an OOV bucket for
-    # values seen at prediction time that were absent from training data.
-    # encode_safe() routes anything unknown here instead of raising.
-    encoders = {}
+
+def build_inputs(df, logic, encoders):
+    """
+    Encode every encoder column with the given fitted encoders and build the
+    Keras input list [item_idx, co_menu_ctx, feature_col_1_idx, ...] plus y.
+    Adds the *_idx and co_menu_ctx columns to df in place.
+    """
     for col in logic.encoder_columns:
-        values = df[col].map(token).astype(str)
-        le = LabelEncoder()
-        le.fit(pd.concat([values, pd.Series(["other"])], ignore_index=True))
-        df[f"{col}_idx"] = le.transform(values)
-        joblib.dump(le, _ap(ck, f"{col}_encoder.pkl"))
-        encoders[col] = le
+        df[f"{col}_idx"] = encoders[col].transform(df[col].map(token).astype(str))
 
     # ── Build co-menu context vectors ─────────────────────────────────────────
     # For each row, record the embedding indices of all OTHER items served on
@@ -340,20 +454,27 @@ def train_model(ck, path, logic, verbose=0):
         + [np.array(df[f"{c}_idx"]) for c in feature_cols]
     )
     y = np.array(df["ideal_pp"], dtype=float)
+    return X, y
 
-    # ── Date-grouped train / test split ───────────────────────────────────────
-    # Split by unique service date rather than by individual row. All items on
-    # the same day share the same co-menu context vector, so a row-level split
-    # would let context items "see" their own test labels — direct data leakage.
+
+def split_train_test(df, test_size=TEST_SIZE):
+    """
+    Return (train_idx, test_idx) as integer row positions into df.
+
+    Split by unique service date rather than by individual row. All items on
+    the same day share the same co-menu context vector, so a row-level split
+    would let context items "see" their own test labels — direct data leakage.
+    Deterministic for a given dataset (fixed SEED).
+    """
     date_groups  = df["date"].dt.normalize().astype("string").fillna("nat")
     unique_dates = date_groups.unique().tolist()
+    rng = np.random.RandomState(SEED)
 
     if len(unique_dates) >= 2:
-        rng = np.random.RandomState(SEED)
         unique_dates = np.array(unique_dates, dtype=object)
         rng.shuffle(unique_dates)
 
-        n_test_dates = max(1, int(round(len(unique_dates) * TEST_SIZE)))
+        n_test_dates = max(1, int(round(len(unique_dates) * test_size)))
         if n_test_dates >= len(unique_dates):
             n_test_dates = len(unique_dates) - 1  # always keep at least one train date
 
@@ -361,63 +482,62 @@ def train_model(ck, path, logic, verbose=0):
         test_mask  = date_groups.isin(test_dates).to_numpy()
         train_mask = ~test_mask
 
-        if train_mask.sum() == 0 or test_mask.sum() == 0:
-            # Degenerate date split (e.g. all rows on the same date) — fall back
-            # to a plain row-level shuffle so training can still proceed.
-            idx = np.arange(len(df))
-            rng.shuffle(idx)
-            cut = max(1, int(round(len(idx) * (1 - TEST_SIZE))))
-            if cut >= len(idx):
-                cut = len(idx) - 1
-            train_idx, test_idx = idx[:cut], idx[cut:]
-            X_train = [arr[train_idx] for arr in X]
-            X_test  = [arr[test_idx]  for arr in X]
-            y_train, y_test = y[train_idx], y[test_idx]
-        else:
-            X_train = [arr[train_mask] for arr in X]
-            X_test  = [arr[test_mask]  for arr in X]
-            y_train, y_test = y[train_mask], y[test_mask]
-    else:
-        # Single-date dataset — row-level shuffle only option.
-        idx = np.arange(len(df))
-        rng = np.random.RandomState(SEED)
-        rng.shuffle(idx)
-        cut = max(1, int(round(len(idx) * (1 - TEST_SIZE))))
-        if cut >= len(idx):
-            cut = len(idx) - 1
-        train_idx, test_idx = idx[:cut], idx[cut:]
-        X_train = [arr[train_idx] for arr in X]
-        X_test  = [arr[test_idx]  for arr in X]
-        y_train, y_test = y[train_idx], y[test_idx]
+        if train_mask.sum() > 0 and test_mask.sum() > 0:
+            return np.flatnonzero(train_mask), np.flatnonzero(test_mask)
+        # Degenerate date split (e.g. all rows on the same date) — fall back
+        # to a plain row-level shuffle so training can still proceed.
 
-    if len(y_train) == 0 or len(y_test) == 0:
-        raise ValueError(
-            f"[{ck}] Not enough rows ({len(df)}) to produce both train and test splits. "
-            "Need at least 2 valid rows."
-        )
+    # Single-date dataset (or degenerate split) — row-level shuffle only option.
+    idx = np.arange(len(df))
+    rng.shuffle(idx)
+    cut = max(1, int(round(len(idx) * (1 - test_size))))
+    if cut >= len(idx):
+        cut = len(idx) - 1
+    return idx[:cut], idx[cut:]
 
-    # ── Build Keras model (TensorFlow) ────────────────────────────────────────
-    # The architecture is constructed dynamically from this client's feature schema
-    # so that adding/removing encoder columns in client_logic.py automatically
-    # changes the model shape — no manual layer editing needed.
-    #
-    # Input streams:
-    #   item        → Embedding(vocab+1, 8) → Flatten
-    #                 Learns a dense vector for the target dish.
-    #   co_menu_ctx → Embedding(vocab+1, 8) → GlobalAveragePooling1D
-    #                 Same vocabulary; averages the embeddings of all co-menu items
-    #                 into a single "menu context" vector.
-    #   feature cols → one Embedding per column (weekday, day_type, holiday_type, …)
-    #                  Dim per column is set by EMB_DIMS above.
-    #
-    # All streams are concatenated → Dense(64, relu) → Dropout(0.3) → Dense(32, relu) → Dense(1)
-    #
-    # TUNING (head size): 64 → 32 → 1 with 30% dropout. Deliberately small —
-    # the concatenated embedding is only ~30 wide and the datasets are a few
-    # thousand rows, so a wider head memorises the training menu instead of
-    # learning it. Dropout 0.3 is the main regulariser; loss is plain MSE on
-    # ideal_pp (kg/person), and Adam runs at its Keras default learning rate.
+
+def fit_encoders(df, logic):
+    """
+    One sklearn LabelEncoder per feature column converts string tokens to
+    integer indices consumed by the Keras Embedding layers.
+    An "other" token is always appended so the encoder has an OOV bucket for
+    values seen at prediction time that were absent from training data.
+    encode_safe() routes anything unknown here instead of raising.
+    """
+    encoders = {}
+    for col in logic.encoder_columns:
+        values = df[col].map(token).astype(str)
+        le = LabelEncoder()
+        le.fit(pd.concat([values, pd.Series(["other"])], ignore_index=True))
+        encoders[col] = le
+    return encoders
+
+
+def build_model(encoders, feature_cols, params):
+    """
+    Build and compile the Keras model for one client's feature schema + params.
+
+    The architecture is constructed dynamically from this client's feature schema
+    so that adding/removing encoder columns in client_logic.py automatically
+    changes the model shape — no manual layer editing needed.
+
+    Input streams:
+      item        → Embedding(vocab+1, item_emb_dim) → Flatten
+                    Learns a dense vector for the target dish.
+      co_menu_ctx → Embedding(vocab+1, item_emb_dim) → GlobalAveragePooling1D
+                    Same vocabulary; averages the embeddings of all co-menu items
+                    into a single "menu context" vector.
+      feature cols → one Embedding per column (weekday, day_type, holiday_type, …)
+                     Dim per column is set by EMB_DIMS above.
+
+    All streams are concatenated → Dense(dense_units[0], relu) → Dropout(dropout)
+    → Dense(dense_units[1], relu) → Dense(1). Loss is plain MSE on ideal_pp.
+    Head size, dropout, item_emb_dim and learning rate come from params
+    (per client — see model_params.json / scripts/tune.py), as do
+    activation, optimizer and loss.
+    """
     vocab_size = len(encoders["menu_items"].classes_)
+    item_dim   = int(params["item_emb_dim"])
 
     # vocab_size + 1 everywhere below: index `vocab_size` is the pad/OOV slot.
     inp_item = tf.keras.Input(shape=(1,),       name="item")
@@ -428,10 +548,10 @@ def train_model(ck, path, logic, verbose=0):
     # separate weight matrices — the item and its context are treated differently.
     embeddings = [
         tf.keras.layers.Flatten()(
-            tf.keras.layers.Embedding(vocab_size + 1, 8)(inp_item)
+            tf.keras.layers.Embedding(vocab_size + 1, item_dim)(inp_item)
         ),
         tf.keras.layers.GlobalAveragePooling1D()(
-            tf.keras.layers.Embedding(vocab_size + 1, 8)(inp_ctx)
+            tf.keras.layers.Embedding(vocab_size + 1, item_dim)(inp_ctx)
         ),
     ]
 
@@ -446,22 +566,160 @@ def train_model(ck, path, logic, verbose=0):
         )
 
     # MLP head
+    units = params["dense_units"]
     x   = tf.keras.layers.Concatenate()(embeddings)
-    x   = tf.keras.layers.Dense(64, activation="relu")(x)
-    x   = tf.keras.layers.Dropout(0.3)(x)
-    x   = tf.keras.layers.Dense(32, activation="relu")(x)
+    x   = tf.keras.layers.Dense(int(units[0]), activation=params["activation"])(x)
+    x   = tf.keras.layers.Dropout(float(params["dropout"]))(x)
+    x   = tf.keras.layers.Dense(int(units[1]), activation=params["activation"])(x)
     out = tf.keras.layers.Dense(1)(x)
 
     model = tf.keras.Model(inputs=inputs, outputs=out)
-    model.compile(optimizer="adam", loss="mse")
+    optimizers = {
+        "adam":    tf.keras.optimizers.Adam,
+        "adamw":   tf.keras.optimizers.AdamW,
+        "rmsprop": tf.keras.optimizers.RMSprop,
+        "sgd":     tf.keras.optimizers.SGD,
+    }
+    losses = {
+        "mse":   tf.keras.losses.MeanSquaredError(),
+        "mae":   tf.keras.losses.MeanAbsoluteError(),
+        "huber": tf.keras.losses.Huber(delta=0.05),   # 50 g: MSE below, MAE above
+    }
+    model.compile(
+        optimizer=optimizers[params["optimizer"]](learning_rate=float(params["learning_rate"])),
+        loss=losses[params["loss"]],
+    )
+    return model
+
+
+def train_model(ck, path, logic, verbose=0, params=None, note=""):
+    params = params or get_params(ck)
+    np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
+    df = prepare_dataset(ck, path, logic)
+
+    # ── Build item lookup maps ────────────────────────────────────────────────
+    # These dicts map item name → sub-category / category. They are saved as
+    # artifacts so the prediction path can resolve sub-cat/cat for any new item
+    # entered at runtime (without re-reading the dataset).
+    item_to_subcat = df.set_index("menu_items")["sub_category"].to_dict()
+    item_to_cat    = df.set_index("menu_items")["category"].to_dict()
+    joblib.dump(item_to_subcat, _ap(ck, "item_to_subcat.pkl"))
+    joblib.dump(item_to_cat,    _ap(ck, "item_to_cat.pkl"))
+    joblib.dump(build_cat_to_subs(item_to_cat, item_to_subcat), _ap(ck, "cat_to_subs.pkl"))
+
+    encoders = fit_encoders(df, logic)
+    for col, le in encoders.items():
+        joblib.dump(le, _ap(ck, f"{col}_encoder.pkl"))
+
+    X, y = build_inputs(df, logic, encoders)
+    feature_cols = [c for c in logic.encoder_columns if c != "menu_items"]
+
+    # ── Date-grouped train / test split (see split_train_test) ────────────────
+    train_idx, test_idx = split_train_test(df, float(params["test_size"]))
+    X_train = [arr[train_idx] for arr in X]
+    X_test  = [arr[test_idx]  for arr in X]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    if len(y_train) == 0 or len(y_test) == 0:
+        raise ValueError(
+            f"[{ck}] Not enough rows ({len(df)}) to produce both train and test splits. "
+            "Need at least 2 valid rows."
+        )
+
+    model = build_model(encoders, feature_cols, params)
+
+    # ── Target: raw ideal_pp, or ideal_pp minus its category's mean ───────────
+    # Means come from TRAIN rows only so the test set stays unseen. The
+    # offsets artifact doubles as the mode flag for predict(): present means
+    # category_offset, absent means raw (a stale one is removed).
+    offsets_path = _ap(ck, "cat_offsets.pkl")
+    base_train = base_test = 0.0
+    if params["target_mode"] == "category_offset":
+        train_df = df.iloc[train_idx]
+        offsets = {k: float(v) for k, v in train_df.groupby("category")["ideal_pp"].mean().items()}
+        offsets["__all__"] = float(train_df["ideal_pp"].mean())
+        joblib.dump(offsets, offsets_path)
+        base = df["category"].map(lambda c: category_offset(offsets, c)).to_numpy(dtype=float)
+        base_train, base_test = base[train_idx], base[test_idx]
+    elif os.path.exists(offsets_path):
+        os.remove(offsets_path)
 
     # ── Train, evaluate, save ─────────────────────────────────────────────────
-    model.fit(X_train, y_train, epochs=EPOCHS, batch_size=BATCH,
-              validation_split=VAL_SPLIT, verbose=verbose)
-    preds = model.predict(X_test, verbose=0).flatten()
+    hist = model.fit(X_train, y_train - base_train, epochs=int(params["epochs"]),
+                     batch_size=int(params["batch"]),
+                     validation_split=float(params["val_split"]), verbose=verbose)
+    preds = model.predict(X_test, verbose=0).flatten() + base_test
     rmse  = float(np.sqrt(mean_squared_error(y_test, preds)))
     model.save(_ap(ck, "per_pax_tf_model.keras"))
+    # Per-epoch loss / val_loss, read by test_model.py for learning curves.
+    # holdout_dates records which test-case days were kept out of training.
+    history = {k: [float(v) for v in vs] for k, vs in hist.history.items()}
+    history["holdout_dates"] = sorted(str(d.date()) for d in holdout_dates(ck))
+    joblib.dump(history, _ap(ck, "fit_history.pkl"))
+    log_training(ck, path, df, train_idx, test_idx, params, rmse, note)
     return model, rmse
+
+
+def log_training(ck, path, df, train_idx, test_idx, params, rmse, note=""):
+    """
+    Append one row per training run to <ck>_training_log.csv next to the model,
+    so every retrain records which data, settings and test error produced it,
+    what changed since the previous run (and what did not), plus an optional
+    free-text note. Settings tests train into a temporary ARTIFACT_DIR, so only
+    production retrains persist here.
+    """
+    import csv, json
+    from datetime import datetime
+    sha = file_sha(path)
+    holdout = sorted(str(d.date()) for d in holdout_dates(ck))
+    log_path = _ap(ck, "training_log.csv")
+
+    # ── What changed vs the previous logged run ───────────────────────────────
+    prev = None
+    if os.path.exists(log_path):
+        with open(log_path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        prev = rows[-1] if rows else None
+    if prev is None:
+        changes = "first logged run"
+    else:
+        changed, same = [], []
+        old_params = json.loads(prev["params"])
+        (changed if prev["dataset_sha"] != sha else same).append(
+            f"dataset ({prev['rows']}→{len(df)} rows)" if prev["dataset_sha"] != sha else "dataset")
+        (changed if prev.get("holdout", "") != ",".join(holdout) else same).append("test-case days")
+        for k in sorted(params):
+            if json.dumps(old_params.get(k)) != json.dumps(params[k]):
+                changed.append(f"{k} {old_params.get(k)}→{params[k]}")
+            else:
+                same.append(k)
+        changes = ("changed: " + ("; ".join(changed) if changed else "nothing")
+                   + " | unchanged: " + ", ".join(same))
+
+    row = {
+        "trained_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "dataset":      os.path.basename(path),
+        "dataset_sha":  sha,
+        "rows":         len(df),
+        "days":         df["date"].dt.normalize().nunique(),
+        "first_date":   str(df["date"].min().date()),
+        "last_date":    str(df["date"].max().date()),
+        "holdout_days": len(holdout),
+        "train_rows":   len(train_idx),
+        "test_rows":    len(test_idx),
+        "test_rmse":    round(rmse, 5),
+        "rmse_change":  "" if prev is None else f"{rmse - float(prev['test_rmse']):+.5f}",
+        "changes":      changes,
+        "note":         note,
+        "params":       json.dumps(params, sort_keys=True),
+        "holdout":      ",".join(holdout),
+    }
+    new_file = not os.path.exists(log_path)
+    with open(log_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row))
+        if new_file:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 # ── Prediction ────────────────────────────────────────────────────────────────
@@ -548,7 +806,10 @@ def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
         feed.append(np.array([encode_safe(encoders[col], feature_values.get(col, ""))]))
 
     # ── Run inference ─────────────────────────────────────────────────────────
-    raw = model.predict(feed, verbose=0)[0][0]
-    pp  = floor005(float(raw))   # round down to 0.005 granularity
+    raw = float(model.predict(feed, verbose=0)[0][0])
+    offsets = load_offsets(ck)
+    if offsets is not None:      # category_offset model: add the category mean back
+        raw += category_offset(offsets, feature_values["category"])
+    pp  = floor005(raw)          # round down to 0.005 granularity
     tq  = pp * mg                # total quantity = per-pax × meal group count
     return PredResult(pp=pp, tq=tq, fb=is_fallback, fi=fallback_item)

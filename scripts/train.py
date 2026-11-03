@@ -5,9 +5,11 @@ Used by .github/workflows/train-models.yml. The Streamlit app refuses to
 train at runtime; this script is the only producer of artifacts/ files.
 
 Usage:
-    python scripts/train.py                       # train all embedding clients
-    python scripts/train.py --client tekion       # train one client
-    python scripts/train.py --client all --force  # retrain even if present
+    python scripts/train.py                       # retrain every client whose settings,
+                                                  # dataset or test days changed
+    python scripts/train.py --client tekion       # same, one client
+    python scripts/train.py --client all --force  # retrain even if up to date
+    python scripts/train.py --client clario --force --note "new dataset"
 
 Exit codes:
     0  every requested client succeeded or was correctly skipped
@@ -31,10 +33,10 @@ os.environ.setdefault("ARTIFACT_DIR", os.path.join(_ROOT, "artifacts"))
 
 from client_database import CLIENT_DB           # noqa: E402
 from client_logic import get_logic              # noqa: E402
-from ml_core import train_model, artifacts_exist  # noqa: E402
+from ml_core import train_model, artifacts_exist, stale_reasons  # noqa: E402
 
 
-def train_one(ck: str, info: dict, force: bool = False) -> bool:
+def train_one(ck: str, info: dict, force: bool = False, note: str = "") -> bool:
     """Train one client. Returns True on success or correct-skip, False on error."""
     if not info.get("has_embeddings"):
         print(f"[skip] {ck}: multiplier-only (no embeddings)")
@@ -48,11 +50,19 @@ def train_one(ck: str, info: dict, force: bool = False) -> bool:
     L = get_logic(ck)
 
     if not force and artifacts_exist(ck, L.encoder_columns):
-        print(f"[skip] {ck}: artifacts already present (use --force to retrain)")
-        return True
+        try:
+            reasons = stale_reasons(ck, ds)
+        except ValueError as e:      # invalid model_params.json entry
+            print(f"[fail] {ck}: {e}")
+            return False
+        if not reasons:
+            print(f"[skip] {ck}: up to date (use --force to retrain anyway)")
+            return True
+        print(f"[stale] {ck}: {'; '.join(reasons)}")
+        note = "; ".join(x for x in [note, "auto-retrain: " + "; ".join(reasons)] if x)
 
     try:
-        _, rmse = train_model(ck, ds, L, verbose=0)
+        _, rmse = train_model(ck, ds, L, verbose=0, note=note)
         print(f"[ok]   {ck}: RMSE={rmse:.4f}")
         return True
     except Exception as e:
@@ -65,9 +75,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--client", default="all",
                         help="Client key (e.g. 'tekion') or 'all'. Default: all.")
+    parser.add_argument("--note", default="",
+                        help="Free-text remark saved in artifacts/<client>_training_log.csv.")
     parser.add_argument("--force", action="store_true",
-                        help="Retrain even if artifacts already exist.")
+                        help="Retrain even if the model is up to date.")
     args = parser.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")   # Windows consoles default to cp1252
 
     if args.client == "all":
         targets = dict(CLIENT_DB)
@@ -84,7 +97,7 @@ def main() -> int:
 
     ok = True
     for ck, info in targets.items():
-        if not train_one(ck, info, force=args.force):
+        if not train_one(ck, info, force=args.force, note=args.note):
             ok = False
 
     print()

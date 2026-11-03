@@ -26,7 +26,7 @@ import streamlit as st
 from client_database import CLIENT_LIST, name_to_key, get_info
 from client_logic import get_logic
 from ml_core import (
-    artifacts_exist, load_map, norm, fmt_cols,
+    artifacts_exist, load_map, norm, fmt_cols, stale_reasons,
     cats_match, get_nv_cats, predict,
 )
 from planner import (
@@ -34,6 +34,7 @@ from planner import (
     aggressive_plan, special_day_mg, avg_vendor_mg, classify_rows, round_to_nearest_5,
 )
 from concurrency import predict_gate, GateBusy
+import test_model
 
 warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
@@ -49,7 +50,7 @@ st.set_page_config(
 
 
 # ═══════════════ CSS ═══════════════
-with open(os.path.join(os.path.dirname(__file__), "styles.css")) as _css_file:
+with open(os.path.join(os.path.dirname(__file__), "styles.css"), encoding="utf-8") as _css_file:
     st.markdown(f"<style>{_css_file.read()}</style>", unsafe_allow_html=True)
 
 
@@ -195,6 +196,22 @@ def _render_production_plan_tab():
         st.stop()
 
     _ensure_artifacts_present()
+
+    # ── STALE-MODEL WARNING ─────────────────────────────────────────────
+    # model_params.json, the dataset and the test-case days are the inputs;
+    # if any changed since the last training, predictions still come from
+    # the old model until `python scripts/train.py` is run.
+    try:
+        stale = stale_reasons(CLIENT_KEY, CLIENT_INFO["dataset"])
+    except ValueError as bad_settings:
+        st.error(f"model_params.json is invalid — {bad_settings}")
+        st.stop()
+    if stale:
+        st.warning(
+            f"**{selected_client_name}'s model is out of date:** {'; '.join(stale)}. "
+            "Predictions below still use the previous model. Run `python scripts/train.py` "
+            "to retrain — the app picks up the new model automatically."
+        )
 
     # ── LOAD MAPPINGS ───────────────────────────────────────────────────
     # Built at training time; let the UI resolve sub-category from an item name
@@ -615,3 +632,79 @@ def _render_production_plan_tab():
 
 
 _render_production_plan_tab()
+
+
+# ═══════════════════════════════════════════════════════
+#  MODEL TEST REPORT (test_model.py)
+# ═══════════════════════════════════════════════════════
+def _render_model_test_section():
+    """
+    Latest evaluation of this client's model + a button to re-run it.
+
+    Evaluate-only: the runtime never retrains, so this scores the artifacts
+    on disk. Retraining + report is `python test_model.py --client <ck> --train`.
+    """
+    st.divider()
+    st.markdown('<div class="sec"><span class="sec-icon">🧪</span><span class="sec-label">Model Test</span></div>', unsafe_allow_html=True)
+
+    button_col, _spacer_col = st.columns([1, 4])
+    with button_col:
+        run_clicked = st.button("Run Model Test", key=key("model_test_btn"), use_container_width=True)
+    if run_clicked:
+        try:
+            with predict_gate():
+                with st.spinner("Evaluating model on held-out test set…"):
+                    test_model.report_client(CLIENT_KEY)
+        except GateBusy as gate_busy:
+            st.warning(str(gate_busy))
+        except Exception as e:
+            st.error(f"Model test failed: {e}")
+
+    run, report_path = test_model.latest_report(CLIENT_KEY)
+    if run is None:
+        st.info("No model test has been run for this client yet — click **Run Model Test**.")
+        return
+
+    m = run["metrics"]
+    st.markdown(f"**Verdict:** {run['verdict']}  \nRun {run['timestamp']} · {run['mode']}")
+    rmse_col, mae_col, mape_col, bias_col, base_col = st.columns(5)
+    with rmse_col:  st.metric("RMSE (kg/person)", f"{m['rmse']:.4f}")
+    with mae_col:   st.metric("MAE (kg/person)",  f"{m['mae']:.4f}")
+    with mape_col:  st.metric("MAPE",             f"{m['mape']:.1f}%")
+    with bias_col:  st.metric("Bias",             f"{m['bias']:+.4f}")
+    with base_col:  st.metric("Baseline RMSE",    f"{m['baseline_rmse']:.4f}",
+                              delta=f"{m['rmse'] - m['baseline_rmse']:+.4f} model vs baseline",
+                              delta_color="inverse")
+
+    if report_path:
+        with st.expander("Full report (all 7 sections)"):
+            # report.md embeds its charts as ![..](file.png); st.markdown can't
+            # resolve local paths, so draw those lines with st.image instead.
+            report_dir, chunk = os.path.dirname(report_path), []
+            with open(report_path, encoding="utf-8") as report_file:
+                for line in report_file.read().splitlines():
+                    if line.startswith("![") and line.endswith(".png)"):
+                        st.markdown("\n".join(chunk)); chunk = []
+                        st.image(os.path.join(report_dir, line[line.index("(") + 1:-1]))
+                    else:
+                        chunk.append(line)
+            st.markdown("\n".join(chunk))
+
+    # Settings tests (`python test_model.py --client <ck> --tests`) train
+    # throwaway models, so the app only shows their latest saved results.
+    tests_path = test_model.latest_tests(CLIENT_KEY)
+    if tests_path:
+        with st.expander(f"Settings tests — {os.path.basename(os.path.dirname(tests_path))}"):
+            sheets = pd.read_excel(tests_path, sheet_name=None)
+            st.markdown("**Accuracy by day**")
+            st.dataframe(sheets["Day accuracy"], use_container_width=True, hide_index=True)
+            # One tab per test-case day (sheets named YYYY-MM-DD).
+            day_names = [name for name in sheets if name[:1].isdigit()]
+            for day_tab, name in zip(st.tabs(day_names), day_names):
+                with day_tab:
+                    st.dataframe(sheets[name], use_container_width=True, hide_index=True)
+            st.markdown("**Category accuracy**")
+            st.dataframe(sheets["Category accuracy"], use_container_width=True, hide_index=True)
+
+
+_render_model_test_section()
