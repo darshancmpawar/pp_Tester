@@ -36,12 +36,12 @@ TEST_SIZE  = 0.2  # fraction of DATES held out as the final (reported) test set
 
 # The original shared settings, kept as the fallback for untuned clients.
 DEFAULT_PARAMS = {
-    "epochs":        20,
+    "epochs":        100,       # MAXIMUM: early stopping (always on) picks the real count
     "batch":         32,
     "learning_rate": 0.001,     # Keras Adam default
     "optimizer":     "adam",    # adam | adamw | rmsprop | sgd
-    "loss":          "mse",     # mse | mae | huber
-    "activation":    "relu",    # hidden-layer activation: relu | elu | gelu | tanh
+    "loss":          "mse",     # mse | mae | huber | pseudo_huber
+    "activation":    "relu",    # hidden-layer activation: relu | leaky_relu | elu | gelu | tanh
     "item_emb_dim":  8,         # width of the dish + co-menu embeddings
     "dense_units":   [64, 32],
     "dropout":       0.3,
@@ -51,6 +51,23 @@ DEFAULT_PARAMS = {
     # 10× in portion (bread pieces vs rasam kg), so the network only has to
     # learn the small per-dish/per-day adjustment, not the category's scale.
     "target_mode":   "raw",
+    "mask_padding":  False,     # ignore pad slots when averaging the co-menu (build_model)
+    "batch_norm":    False,     # BatchNormalization after each hidden Dense, before its activation
+    # Output layer: linear, or softplus (always > 0). softplus only suits target_mode "raw":
+    # category_offset predicts a gap from the category mean, which is often negative.
+    "output_activation": "linear",
+    # Random starting weights only; the train/test split always uses SEED, so runs stay comparable.
+    "seed":          SEED,
+    # Switch point of huber / pseudo_huber, kg. Errors below it are treated like MSE
+    # (chases the average), above it like MAE (chases the typical dish).
+    "loss_delta":    0.05,
+    # Early stopping is always on: training stops after this many epochs without a
+    # better validation loss and keeps the weights from the best epoch. Those extra
+    # epochs also show on the learning curve, proving the kept epoch is the best.
+    "early_stopping": 5,
+    # Optional features derived from each row's date and headcount (see
+    # derive_extra_features): any of "month", "month_part", "mg_band".
+    "extra_features": [],
     "val_split":     VAL_SPLIT,
     "test_size":     TEST_SIZE,
 }
@@ -72,10 +89,25 @@ def holdout_dates(ck):
     dates = pd.to_datetime(pd.read_excel(path, sheet_name="cases")["date"], errors="coerce")
     return set(dates.dropna().dt.normalize())
 
+EXTRA_FEATURES = ("month", "month_part", "mg_band")
+
+def month_part(day):
+    """Day of month as early (1-10) / mid (11-20) / late (21-31); 31 exact days are too sparse."""
+    return "early" if day <= 10 else "mid" if day <= 20 else "late"
+
+def mg_band(mg):
+    """Expected headcount in bands of 50 heads, e.g. 137 → "100"."""
+    return str(int(mg) // 50 * 50)
+
+def model_columns(logic, params):
+    """Feature columns a model with these settings is trained on, in input order."""
+    return list(logic.encoder_columns) + list(params["extra_features"])
+
 PARAM_CHOICES = {
     "optimizer":   ("adam", "adamw", "rmsprop", "sgd"),
-    "loss":        ("mse", "mae", "huber"),
-    "activation":  ("relu", "elu", "gelu", "tanh"),
+    "loss":        ("mse", "mae", "huber", "pseudo_huber"),
+    "activation":  ("relu", "leaky_relu", "elu", "gelu", "tanh"),
+    "output_activation": ("linear", "softplus"),
     "target_mode": ("raw", "category_offset"),
 }
 
@@ -88,6 +120,26 @@ def validate_params(params, where):
     for k, choices in PARAM_CHOICES.items():
         if k in params and params[k] not in choices:
             raise ValueError(f"{where}: {k}={params[k]!r} — must be one of {list(choices)}.")
+    if "early_stopping" in params and not (isinstance(params["early_stopping"], int)
+                                           and not isinstance(params["early_stopping"], bool)
+                                           and params["early_stopping"] >= 1):
+        raise ValueError(f"{where}: early_stopping={params['early_stopping']!r} — must be a whole "
+                         "number of epochs, 1 or more (early stopping is always on).")
+    if "extra_features" in params and not (isinstance(params["extra_features"], list)
+                                           and set(params["extra_features"]) <= set(EXTRA_FEATURES)):
+        raise ValueError(f"{where}: extra_features={params['extra_features']!r} — must be a list "
+                         f"drawn from {list(EXTRA_FEATURES)}.")
+    if params.get("output_activation") == "softplus" and params.get("target_mode") == "category_offset":
+        raise ValueError(f"{where}: output_activation softplus cannot predict the negative gaps "
+                         "category_offset needs; use target_mode raw.")
+    if "loss_delta" in params and not params["loss_delta"] > 0:
+        raise ValueError(f"{where}: loss_delta={params['loss_delta']!r} — must be above 0 (kg).")
+    if "seed" in params and not (isinstance(params["seed"], int) and params["seed"] >= 0):
+        raise ValueError(f"{where}: seed={params['seed']!r} — must be a whole number, 0 or more.")
+    if "batch_norm" in params and not isinstance(params["batch_norm"], bool):
+        raise ValueError(f"{where}: batch_norm={params['batch_norm']!r} — must be true or false.")
+    if "mask_padding" in params and not isinstance(params["mask_padding"], bool):
+        raise ValueError(f"{where}: mask_padding={params['mask_padding']!r} — must be true or false.")
     for k in ("epochs", "batch", "item_emb_dim"):
         if k in params and not (isinstance(params[k], int) and params[k] > 0):
             raise ValueError(f"{where}: {k}={params[k]!r} — must be a whole number above 0.")
@@ -132,7 +184,8 @@ def stale_reasons(ck, dataset_path):
     if not rows:
         return ["no training log yet"]
     last, reasons = rows[-1], []
-    trained = json.loads(last["params"])
+    # A setting added after that run is logged as absent; it trained with the default.
+    trained = {**DEFAULT_PARAMS, **json.loads(last["params"])}
     for k, v in get_params(ck).items():
         if json.dumps(trained.get(k)) != json.dumps(v):
             reasons.append(f"{k} {trained.get(k)}→{v}")
@@ -145,20 +198,23 @@ def stale_reasons(ck, dataset_path):
 # TUNING: embedding width per feature, in floats. Roughly "how much the model
 # is allowed to memorise about this column". Wider = more capacity and more
 # overfitting risk; the rule of thumb here is width ∝ cardinality:
-#   menu_items    hundreds of dishes   → 8
+#   menu_items    hundreds of dishes   → item_emb_dim setting (default 8), not this dict
 #   sub_category  tens                 → 4
 #   category      ~10                  → 4
 #   weekday       5–7                  → 2
 #   day_type      4, holiday_type 4, meal_day 2 → 2
+#   month 12 → 3,  month_part 3 → 2,  mg_band ~5-20 → 3
 # A column missing from this dict falls back to 2 (see the model builder).
 EMB_DIMS = {
-    "menu_items":   8,
     "sub_category": 4,
     "category":     4,
     "weekday":      2,
     "day_type":     2,
     "holiday_type": 2,
     "meal_day":     2,
+    "month":        3,
+    "month_part":   2,
+    "mg_band":      3,
 }
 
 
@@ -208,7 +264,7 @@ def artifacts_exist(ck, encoder_columns):
     expected = (
         ["per_pax_tf_model.keras"]
         + [f"{c}_encoder.pkl" for c in encoder_columns]
-        + ["item_to_subcat.pkl", "item_to_cat.pkl", "cat_to_subs.pkl"]
+        + ["item_to_subcat.pkl", "item_to_cat.pkl", "cat_to_subs.pkl", "features.pkl"]
     )
     return all(os.path.exists(_ap(ck, f)) for f in expected)
 
@@ -241,7 +297,9 @@ def _load_cached(cache_key, path, loader_fn):
 def load_model(ck):
     # TensorFlow Keras model — the heavy artifact, loaded once per client.
     path = _ap(ck, "per_pax_tf_model.keras")
-    return _load_cached(f"{ck}:mdl", path, lambda: tf.keras.models.load_model(path))
+    # compile=False: prediction never needs the training loss, so any loss (e.g. a
+    # pseudo_huber with a custom delta) loads without being registered with Keras.
+    return _load_cached(f"{ck}:mdl", path, lambda: tf.keras.models.load_model(path, compile=False))
 
 def load_enc(ck, col):
     # LabelEncoder for a single feature column.
@@ -399,6 +457,11 @@ def prepare_dataset(ck, path, logic):
 
     # Derive weekday from date (not stored in most datasets).
     df["weekday"] = df["date"].dt.day_name().map(norm)
+    # Candidate extra features (used only when listed in extra_features).
+    df["month"] = df["date"].dt.month_name().map(norm)
+    df["month_part"] = df["date"].dt.day.map(month_part)
+    if "client_mg" in df.columns:
+        df["mg_band"] = pd.to_numeric(df["client_mg"], errors="coerce").fillna(0).map(mg_band)
 
     for col in logic.encoder_columns:
         if col not in df.columns and col in autofill_defaults:
@@ -411,13 +474,13 @@ def prepare_dataset(ck, path, logic):
     return df
 
 
-def build_inputs(df, logic, encoders):
+def build_inputs(df, columns, encoders):
     """
     Encode every encoder column with the given fitted encoders and build the
     Keras input list [item_idx, co_menu_ctx, feature_col_1_idx, ...] plus y.
     Adds the *_idx and co_menu_ctx columns to df in place.
     """
-    for col in logic.encoder_columns:
+    for col in columns:
         df[f"{col}_idx"] = encoders[col].transform(df[col].map(token).astype(str))
 
     # ── Build co-menu context vectors ─────────────────────────────────────────
@@ -448,7 +511,7 @@ def build_inputs(df, logic, encoders):
     # feature_cols = every encoder column except menu_items (handled separately).
     # X is a list of arrays matching the model's input layer order:
     #   [item_idx, co_menu_ctx, feature_col_1_idx, feature_col_2_idx, ...]
-    feature_cols = [c for c in logic.encoder_columns if c != "menu_items"]
+    feature_cols = [c for c in columns if c != "menu_items"]
     X = (
         [np.array(df["menu_items_idx"]), np.array(df["co_menu_ctx"].tolist())]
         + [np.array(df[f"{c}_idx"]) for c in feature_cols]
@@ -496,7 +559,7 @@ def split_train_test(df, test_size=TEST_SIZE):
     return idx[:cut], idx[cut:]
 
 
-def fit_encoders(df, logic):
+def fit_encoders(df, columns):
     """
     One sklearn LabelEncoder per feature column converts string tokens to
     integer indices consumed by the Keras Embedding layers.
@@ -505,12 +568,20 @@ def fit_encoders(df, logic):
     encode_safe() routes anything unknown here instead of raising.
     """
     encoders = {}
-    for col in logic.encoder_columns:
+    for col in columns:
         values = df[col].map(token).astype(str)
         le = LabelEncoder()
         le.fit(pd.concat([values, pd.Series(["other"])], ignore_index=True))
         encoders[col] = le
     return encoders
+
+
+def pseudo_huber(delta):
+    """Smooth Huber loss: ≈ MSE for errors under delta, ≈ MAE above, differentiable everywhere."""
+    def loss(y_true, y_pred):
+        r = (y_pred - y_true) / delta
+        return tf.keras.ops.mean(delta ** 2 * (tf.keras.ops.sqrt(1 + r * r) - 1), axis=-1)
+    return loss
 
 
 def build_model(encoders, feature_cols, params):
@@ -530,8 +601,9 @@ def build_model(encoders, feature_cols, params):
       feature cols → one Embedding per column (weekday, day_type, holiday_type, …)
                      Dim per column is set by EMB_DIMS above.
 
-    All streams are concatenated → Dense(dense_units[0], relu) → Dropout(dropout)
-    → Dense(dense_units[1], relu) → Dense(1). Loss is plain MSE on ideal_pp.
+    All streams are concatenated → Dense(dense_units[0]) [→ BatchNorm] → activation
+    → Dropout(dropout) → Dense(dense_units[1]) [→ BatchNorm] → activation
+    → Dense(1, output_activation).
     Head size, dropout, item_emb_dim and learning rate come from params
     (per client — see model_params.json / scripts/tune.py), as do
     activation, optimizer and loss.
@@ -546,13 +618,16 @@ def build_model(encoders, feature_cols, params):
 
     # Two independent Embedding layers share the same vocabulary but learn
     # separate weight matrices — the item and its context are treated differently.
+    # Layer creation order fixes the random starting weights: keep item before ctx,
+    # or a retrain with unchanged settings no longer reproduces the saved model.
+    item_emb = tf.keras.layers.Embedding(vocab_size + 1, item_dim)(inp_item)
+    ctx_emb  = tf.keras.layers.Embedding(vocab_size + 1, item_dim)(inp_ctx)
+    # mask_padding: average only the real co-menu dishes. Without it, a day with
+    # 4 other dishes averages 4 real embeddings with 6 copies of the pad slot.
+    ctx_mask = tf.keras.ops.not_equal(inp_ctx, vocab_size) if params["mask_padding"] else None
     embeddings = [
-        tf.keras.layers.Flatten()(
-            tf.keras.layers.Embedding(vocab_size + 1, item_dim)(inp_item)
-        ),
-        tf.keras.layers.GlobalAveragePooling1D()(
-            tf.keras.layers.Embedding(vocab_size + 1, item_dim)(inp_ctx)
-        ),
+        tf.keras.layers.Flatten()(item_emb),
+        tf.keras.layers.GlobalAveragePooling1D()(ctx_emb, mask=ctx_mask),
     ]
 
     for col in feature_cols:
@@ -568,10 +643,16 @@ def build_model(encoders, feature_cols, params):
     # MLP head
     units = params["dense_units"]
     x   = tf.keras.layers.Concatenate()(embeddings)
-    x   = tf.keras.layers.Dense(int(units[0]), activation=params["activation"])(x)
+    def hidden(x, n):
+        if not params["batch_norm"]:
+            return tf.keras.layers.Dense(n, activation=params["activation"])(x)
+        x = tf.keras.layers.BatchNormalization()(tf.keras.layers.Dense(n)(x))
+        return tf.keras.layers.Activation(params["activation"])(x)
+
+    x   = hidden(x, int(units[0]))
     x   = tf.keras.layers.Dropout(float(params["dropout"]))(x)
-    x   = tf.keras.layers.Dense(int(units[1]), activation=params["activation"])(x)
-    out = tf.keras.layers.Dense(1)(x)
+    x   = hidden(x, int(units[1]))
+    out = tf.keras.layers.Dense(1, activation=params["output_activation"])(x)
 
     model = tf.keras.Model(inputs=inputs, outputs=out)
     optimizers = {
@@ -583,7 +664,8 @@ def build_model(encoders, feature_cols, params):
     losses = {
         "mse":   tf.keras.losses.MeanSquaredError(),
         "mae":   tf.keras.losses.MeanAbsoluteError(),
-        "huber": tf.keras.losses.Huber(delta=0.05),   # 50 g: MSE below, MAE above
+        "huber": tf.keras.losses.Huber(delta=float(params["loss_delta"])),
+        "pseudo_huber": pseudo_huber(float(params["loss_delta"])),
     }
     model.compile(
         optimizer=optimizers[params["optimizer"]](learning_rate=float(params["learning_rate"])),
@@ -594,7 +676,8 @@ def build_model(encoders, feature_cols, params):
 
 def train_model(ck, path, logic, verbose=0, params=None, note=""):
     params = params or get_params(ck)
-    np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
+    seed = int(params["seed"])
+    np.random.seed(seed); tf.random.set_seed(seed); random.seed(seed)
     df = prepare_dataset(ck, path, logic)
 
     # ── Build item lookup maps ────────────────────────────────────────────────
@@ -607,12 +690,16 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
     joblib.dump(item_to_cat,    _ap(ck, "item_to_cat.pkl"))
     joblib.dump(build_cat_to_subs(item_to_cat, item_to_subcat), _ap(ck, "cat_to_subs.pkl"))
 
-    encoders = fit_encoders(df, logic)
+    columns = model_columns(logic, params)
+    if "mg_band" in columns and "mg_band" not in df.columns:
+        raise ValueError(f"[{ck}] extra feature mg_band needs a client_mg column in the dataset.")
+    encoders = fit_encoders(df, columns)
     for col, le in encoders.items():
         joblib.dump(le, _ap(ck, f"{col}_encoder.pkl"))
+    joblib.dump(columns, _ap(ck, "features.pkl"))   # predict() feeds exactly these
 
-    X, y = build_inputs(df, logic, encoders)
-    feature_cols = [c for c in logic.encoder_columns if c != "menu_items"]
+    X, y = build_inputs(df, columns, encoders)
+    feature_cols = [c for c in columns if c != "menu_items"]
 
     # ── Date-grouped train / test split (see split_train_test) ────────────────
     train_idx, test_idx = split_train_test(df, float(params["test_size"]))
@@ -645,7 +732,10 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
         os.remove(offsets_path)
 
     # ── Train, evaluate, save ─────────────────────────────────────────────────
-    hist = model.fit(X_train, y_train - base_train, epochs=int(params["epochs"]),
+    patience = int(params["early_stopping"])
+    callbacks = [tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience,
+                                                  restore_best_weights=True)]
+    hist = model.fit(X_train, y_train - base_train, epochs=int(params["epochs"]), callbacks=callbacks,
                      batch_size=int(params["batch"]),
                      validation_split=float(params["val_split"]), verbose=verbose)
     preds = model.predict(X_test, verbose=0).flatten() + base_test
@@ -655,6 +745,12 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
     # holdout_dates records which test-case days were kept out of training.
     history = {k: [float(v) for v in vs] for k, vs in hist.history.items()}
     history["holdout_dates"] = sorted(str(d.date()) for d in holdout_dates(ck))
+    # Spread of what the model actually learned (raw ideal_pp, or the gap from
+    # the category mean): test_model.fit_diagnosis compares val loss with it.
+    history["target_std"] = float(np.std(y_train - base_train))
+    # fit_diagnosis needs these to tell "stopped early at the best epoch" from "ran out of epochs".
+    history["early_stopping"] = patience
+    history["max_epochs"] = int(params["epochs"])
     joblib.dump(history, _ap(ck, "fit_history.pkl"))
     log_training(ck, path, df, train_idx, test_idx, params, rmse, note)
     return model, rmse
@@ -684,7 +780,7 @@ def log_training(ck, path, df, train_idx, test_idx, params, rmse, note=""):
         changes = "first logged run"
     else:
         changed, same = [], []
-        old_params = json.loads(prev["params"])
+        old_params = {**DEFAULT_PARAMS, **json.loads(prev["params"])}
         (changed if prev["dataset_sha"] != sha else same).append(
             f"dataset ({prev['rows']}→{len(df)} rows)" if prev["dataset_sha"] != sha else "dataset")
         (changed if prev.get("holdout", "") != ",".join(holdout) else same).append("test-case days")
@@ -740,11 +836,13 @@ class PredResult:
 
 
 def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
-            day_type=None, holiday_type=None, meal_day=None):
+            day_type=None, holiday_type=None, meal_day=None, service_date=None):
     model          = load_model(ck)
     item_enc       = load_enc(ck, "menu_items")
     item_to_subcat = load_map(ck, "item_to_subcat")
-    feature_cols   = [c for c in logic.encoder_columns if c != "menu_items"]
+    feature_cols   = [c for c in load_map(ck, "features") if c != "menu_items"]
+    if {"month", "month_part"} & set(feature_cols) and service_date is None:
+        return PredResult(err="This model uses the date (month features); pass service_date.")
 
     item_token   = (item or "").strip()
     menu_tokens  = [(i or "").strip() for i in menu]
@@ -796,6 +894,9 @@ def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
         "day_type":      logic.canonicalize_day_type(day_type or "regular"),
         "holiday_type":  logic.canonicalize_holiday_type(holiday_type or "not applicable"),
         "meal_day":      logic.canonicalize_meal_day(meal_day or "veg"),
+        "month":         norm(service_date.strftime("%B")) if service_date else None,
+        "month_part":    month_part(service_date.day) if service_date else None,
+        "mg_band":       mg_band(mg),
     }
 
     # Load all encoders before the loop — one cache lookup per column, not one per iteration.
@@ -810,6 +911,8 @@ def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
     offsets = load_offsets(ck)
     if offsets is not None:      # category_offset model: add the category mean back
         raw += category_offset(offsets, feature_values["category"])
-    pp  = floor005(raw)          # round down to 0.005 granularity
+    # Rounding to the 5 g grid is switched off so tests see the true regression output.
+    # pp = floor005(raw)         # round down to 0.005 granularity
+    pp  = raw
     tq  = pp * mg                # total quantity = per-pax × meal group count
     return PredResult(pp=pp, tq=tq, fb=is_fallback, fi=fallback_item)

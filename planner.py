@@ -21,8 +21,8 @@ from ml_core import norm, cats_match
 #         a headcount of 287 reads as false precision on an ops sheet.
 #   PP  → multiples of 0.005 kg (5 g). Finer than that is below what a serving
 #         spoon can distinguish, so it is noise in the plan.
-# Changing either changes every plan the app prints. Keep them in step with
-# ml_core.floor005(), which applies the same 5 g grid to model output.
+# Changing either changes every plan the app prints. ml_core.floor005() applies
+# the same 5 g grid to model output, but is currently commented out in predict().
 
 def round_to_nearest_5(x):
     """Round x to the nearest multiple of 5 (used for MG figures)."""
