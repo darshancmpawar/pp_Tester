@@ -11,6 +11,7 @@ Why this is needed:
 What we expose:
   predict_gate()  — bounded semaphore; caps concurrent predict loops.
   cache_lock()    — guards ml_core._model_cache against TOCTOU on first load.
+  training_slot() — one Retrain-button run at a time; never queues.
   GateBusy        — raised on timeout; UI shows a clean retry message.
 
 Tunable via env:
@@ -44,6 +45,21 @@ class GateBusy(Exception):
 # ── Module-level state. Lifetime = lifetime of the Streamlit process. ──
 _PREDICT_SEM = threading.BoundedSemaphore(value=MAX_CONCURRENT_PREDICTS)
 _CACHE_LOCK  = threading.Lock()
+_TRAIN_LOCK  = threading.Lock()
+
+
+@contextmanager
+def training_slot() -> Iterator[None]:
+    """
+    One training run at a time across all sessions (the app's Retrain button).
+    Does not wait: a second click while training raises GateBusy at once.
+    """
+    if not _TRAIN_LOCK.acquire(blocking=False):
+        raise GateBusy("A model is already training. Try again when it finishes.")
+    try:
+        yield
+    finally:
+        _TRAIN_LOCK.release()
 
 
 @contextmanager

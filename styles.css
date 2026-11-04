@@ -26,6 +26,8 @@
 
 /* ── RESET / GLOBAL ── */
 *, *::before, *::after { font-family:'Inter',sans-serif !important; box-sizing:border-box; }
+/* Streamlit's icons (expander arrows etc.) are ligatures in an icon font; under Inter they print as "arrow_right". */
+[data-testid="stIconMaterial"] { font-family:'Material Symbols Rounded' !important; }
 
 /* ── APP SHELL ── */
 .stApp,
@@ -119,7 +121,8 @@ label { color:var(--tsec) !important; font-size:.8rem !important; font-weight:50
 .stTextArea textarea::placeholder { color:var(--tmut) !important; }
 
 /* ── BUTTON ── */
-.stButton>button {
+/* Descendant, not child: a button with a tooltip is wrapped one level deeper. */
+.stButton button {
     background:var(--accent) !important;
     color:#fff !important;
     border:none !important;
@@ -131,11 +134,13 @@ label { color:var(--tsec) !important; font-size:.8rem !important; font-weight:50
     transition:background .15s ease,box-shadow .15s ease !important;
     box-shadow:none !important;
 }
-.stButton>button:hover {
+/* The label sits in a <p>, which the global p rule would turn grey. */
+.stButton button p { color:#fff !important; }
+.stButton button:hover {
     background:#6aa3f8 !important;
     box-shadow:0 0 0 3px var(--adim) !important;
 }
-.stButton>button:active { background:#3b7cf0 !important; }
+.stButton button:active { background:#3b7cf0 !important; }
 
 /* ── TABS ── */
 .stTabs [data-baseweb="tab-list"] {

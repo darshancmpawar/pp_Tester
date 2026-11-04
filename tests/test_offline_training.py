@@ -265,10 +265,11 @@ class TestLoadDatasetSheetSelection:
 # ═══════════════════════════════════════════════════════════════════════
 # app.py UX — _ensure() must NOT train at runtime anymore
 # ═══════════════════════════════════════════════════════════════════════
-class TestAppDoesNotTrain:
+class TestAppDoesNotTrainInProcess:
     def test_app_imports_no_training_symbols(self):
-        """Sanity: app.py must not import train_model, train_gate, or clear_cache."""
+        """app.py may retrain only by running scripts/train.py as a subprocess, never in-process."""
         src = open("app.py", encoding="utf-8").read()
+        assert '"scripts", "train.py"' in src, "the Retrain button should shell out to scripts/train.py"
         assert "train_model" not in src, "app.py should not reference train_model"
         assert "train_gate" not in src, "app.py should not reference train_gate"
         assert "clear_cache" not in src, "app.py should not reference clear_cache"

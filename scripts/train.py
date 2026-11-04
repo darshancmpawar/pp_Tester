@@ -36,7 +36,7 @@ from client_logic import get_logic              # noqa: E402
 from ml_core import train_model, artifacts_exist, stale_reasons  # noqa: E402
 
 
-def train_one(ck: str, info: dict, force: bool = False, note: str = "") -> bool:
+def train_one(ck: str, info: dict, force: bool = False, note: str = "", verbose: int = 0) -> bool:
     """Train one client. Returns True on success or correct-skip, False on error."""
     if not info.get("has_embeddings"):
         print(f"[skip] {ck}: multiplier-only (no embeddings)")
@@ -62,7 +62,7 @@ def train_one(ck: str, info: dict, force: bool = False, note: str = "") -> bool:
         note = "; ".join(x for x in [note, "auto-retrain: " + "; ".join(reasons)] if x)
 
     try:
-        _, rmse = train_model(ck, ds, L, verbose=0, note=note)
+        _, rmse = train_model(ck, ds, L, verbose=verbose, note=note)
         print(f"[ok]   {ck}: RMSE={rmse:.4f}")
         return True
     except Exception as e:
@@ -97,7 +97,8 @@ def main() -> int:
 
     ok = True
     for ck, info in targets.items():
-        if not train_one(ck, info, force=args.force, note=args.note):
+        # verbose=1: Keras progress bar with training and validation loss for every epoch.
+        if not train_one(ck, info, force=args.force, note=args.note, verbose=1):
             ok = False
 
     print()

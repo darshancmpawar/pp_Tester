@@ -127,3 +127,13 @@ class TestCacheLock:
         for j in range(0, len(order), 2):
             assert order[j][0] == "in"
             assert order[j + 1] == ("out", order[j][1])
+
+
+def test_training_slot_rejects_a_second_run():
+    import concurrency as conc
+    with conc.training_slot():
+        with pytest.raises(conc.GateBusy):
+            with conc.training_slot():
+                pass
+    with conc.training_slot():   # released after the first run ends
+        pass

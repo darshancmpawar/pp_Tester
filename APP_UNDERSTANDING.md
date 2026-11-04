@@ -181,7 +181,7 @@ Head:
 
 Output:
 - predicted `ideal_pp`
-- post-processed with flooring to 0.005 granularity
+- raw model output (the 0.005 floor in `ml_core.predict` is commented out)
 - `total_qty = per_pax * mg`
 
 ---
@@ -286,7 +286,7 @@ Every operational constant is documented beside its definition. Index:
 | Contracted billing portions | `client_logic.py` | `fixed_pp_map` |
 | Per-client epochs, batch, learning rate, head size, dropout | `model_params.json` (written by `scripts/tune.py`) | per client key |
 | Shared embedding widths / context length | `ml_core.py` | `EMB_DIMS`, `CTX_LEN`, `DEFAULT_PARAMS` |
-| Output rounding grids (5 heads / 5 g) | `planner.py`, `ml_core.py` | `round_to_nearest_5`, `floor005` |
+| Output rounding grids (5 heads; 5 g currently off) | `planner.py`, `ml_core.py` | `round_to_nearest_5`, `floor005` |
 | Concurrent prediction limit | `concurrency.py` | `MAX_CONCURRENT_PREDICTS` |
 
 Changing anything in `encoder_columns` or `EMB_DIMS` requires a retrain:

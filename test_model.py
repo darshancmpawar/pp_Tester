@@ -57,11 +57,17 @@ SETTING_NOTES = {
     "batch":         "rows per gradient step",
     "learning_rate": "optimizer step size",
     "optimizer":     "adam | adamw | rmsprop | sgd",
-    "loss":          "error the model minimises: mse | mae | huber",
-    "activation":    "hidden-layer activation: relu | elu | gelu | tanh",
+    "loss":          "error the model minimises: mse | mae | huber | pseudo_huber",
+    "activation":    "hidden-layer activation: relu | leaky_relu | elu | gelu | tanh",
+    "batch_norm":    "TRUE = batch normalisation after each hidden layer",
+    "loss_delta":    "huber / pseudo_huber switch point in kg: smaller = more like MAE (more dishes close)",
+    "output_activation": "linear | softplus (always > 0; only with target_mode raw)",
     "dense_units":   "neurons in hidden layer 1, layer 2 (e.g. 128,64)",
     "dropout":       "fraction of layer-1 outputs dropped while training",
     "target_mode":   "raw = predict ideal_pp | category_offset = predict gap from category mean",
+    "mask_padding":  "TRUE = ignore empty co-menu slots when averaging the day's menu",
+    "early_stopping": "always on: stop after N epochs without improvement, keep the best (epochs = maximum)",
+    "extra_features": "comma list of month, month_part (early/mid/late), mg_band (headcount per 50); blank = none",
     "item_emb_dim":  "embedding width for the dish and its co-menu",
     "val_split":     "fraction of training rows watched as validation",
     "test_size":     "fraction of dataset days held out as the internal test set",
@@ -118,65 +124,96 @@ def save_runs(ck, runs):
     with open(p, "w", encoding="utf-8") as f:
         json.dump(runs, f, indent=2)
 
-def latest_report(ck):
-    """(run summary, report.md path) of the most recent run, or (None, None)."""
+def latest_run(ck):
+    """Summary of the most recent Run Model Test (verdict, checks, metrics), or None."""
     runs = load_runs(ck)
-    if not runs:
-        return None, None
-    path = os.path.join(REPORT_DIR, ck, runs[-1]["timestamp"], "report.md")
-    return runs[-1], (path if os.path.exists(path) else None)
+    return runs[-1] if runs else None
 
 
 # ── Section 1: learning curves ────────────────────────────────────────────────
 
-def learning_curves(ck, y_train, out_dir):
+def fit_history(ck):
+    """Per-epoch loss / val_loss of the client's current model, or None."""
     path = ml_core._ap(ck, "fit_history.pkl")
     if not os.path.exists(path):
-        return None, ("No fit history saved for this model (it was trained before "
-                      "history logging existed). Run with `--train` to get learning curves.")
+        return None
     hist = ml_core.joblib.load(path)
-    loss, val = hist.get("loss", []), hist.get("val_loss", [])
-    if not loss or not val:
-        return None, "Fit history has no validation loss."
+    return hist if hist.get("loss") and hist.get("val_loss") else None
 
+
+def best_epoch_label(best, n):
+    """'best epoch 10', or 'lowest so far (last epoch)' when the curve never bottomed out."""
+    return "lowest so far (last epoch)" if best == n else f"best epoch {best}"
+
+
+def fit_diagnosis(hist):
+    """
+    (verdict, explanation) from a fit history: verdict is one of
+    "overfitting", "underfitting", "still learning", "good fit".
+
+    target_std is the spread of what the model was trained on (ideal_pp, or the
+    gap from the category mean for category_offset). A validation RMSE close to
+    it means the model barely beats predicting that mean for every dish.
+    """
+    loss, val = hist["loss"], hist["val_loss"]
+    n, best = len(val), int(np.argmin(val)) + 1
+    val_rmse, target_std = float(np.sqrt(min(val))), hist["target_std"]
+    if hist.get("early_stopping") and n < hist["max_epochs"]:
+        if val_rmse > 0.8 * target_std:
+            return "underfitting", (
+                f"Early stopping kept epoch {best}, but its validation RMSE {val_rmse:.4f} is close to "
+                f"the spread of the target ({target_std:.4f}): the model barely beats a constant.")
+        return "good fit", (
+            f"Early stopping ended training at epoch {n} and kept the weights from epoch {best}, "
+            f"where validation loss was lowest. Best validation RMSE {val_rmse:.4f} vs target "
+            f"spread {target_std:.4f}.")
+    if best <= n - 3 and val[-1] > min(val) * 1.10 and loss[-1] < loss[best - 1]:
+        return "overfitting", (
+            f"Validation loss bottomed at epoch {best} and rose {(val[-1] / min(val) - 1) * 100:.0f}% "
+            f"by epoch {n} while training loss kept falling: the model is memorising the "
+            f"training days. Lower epochs to about {best}, or raise dropout.")
+    if val_rmse > 0.8 * target_std:
+        return "underfitting", (
+            f"Best validation RMSE {val_rmse:.4f} is close to the spread of the target "
+            f"({target_std:.4f}): the model barely beats a constant. Try more epochs, a higher "
+            f"learning rate or wider layers.")
+    if best == n and n >= 3 and val[-1] < val[-3] * 0.98:
+        return "still learning", (
+            f"Validation loss was still falling when training stopped at epoch {n}, so its lowest "
+            f"point is simply the last epoch; it has not bottomed out. More epochs may help.")
+    return "good fit", (
+        f"Validation loss levelled off without rising; best epoch {best} of {n}. "
+        f"Best validation RMSE {val_rmse:.4f} vs target spread {target_std:.4f}.")
+
+
+def learning_curves(ck, out_dir):
+    hist = fit_history(ck)
+    if hist is None:
+        return None, "No fit history saved for this model. Retrain it to get learning curves."
+    loss, val = hist["loss"], hist["val_loss"]
     epochs = np.arange(1, len(loss) + 1)
+    best = int(np.argmin(val)) + 1
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.plot(epochs, loss, marker="o", ms=3, label="train loss (MSE)")
     ax.plot(epochs, val, marker="o", ms=3, label="validation loss (MSE)")
-    best = int(np.argmin(val)) + 1
-    ax.axvline(best, color="grey", ls="--", lw=1, label=f"best epoch ({best})")
+    ax.axvline(best, color="grey", ls="--", lw=1, label=best_epoch_label(best, len(val)))
     ax.set_yscale("log")   # epoch-1 loss is ~100× the rest; linear hides the tail
     ax.set_xlabel("epoch"); ax.set_ylabel("MSE (kg/person)², log scale")
     ax.set_title(f"{ck} — learning curves"); ax.legend(); ax.grid(alpha=0.3)
     fig.tight_layout(); fig.savefig(os.path.join(out_dir, "learning_curves.png"), dpi=110)
     plt.close(fig)
-
-    # Fit diagnosis. Val RMSE close to the target's std means the model is
-    # barely better than predicting the mean for every dish.
-    target_std = float(np.std(y_train))
-    val_rmse   = float(np.sqrt(min(val)))
-    n = len(val)
-    if best <= n - 3 and val[-1] > min(val) * 1.10 and loss[-1] < loss[best - 1]:
-        diag = (f"**Overfitting** — validation loss bottomed at epoch {best} and rose "
-                f"{(val[-1] / min(val) - 1) * 100:.0f}% after, while train loss kept falling.")
-    elif val_rmse > 0.8 * target_std:
-        diag = (f"**Underfitting** — best val RMSE {val_rmse:.4f} is close to the target's "
-                f"spread (std {target_std:.4f}); the model barely beats a constant.")
-    elif best == n and n >= 3 and val[-1] < val[-3] * 0.98:
-        diag = (f"**Underfitting (still learning)** — validation loss was still falling at the "
-                f"last epoch ({n}); more epochs would likely help.")
-    else:
-        diag = f"**Good fit** — validation loss flattened without rising; best epoch {best}."
-    return {"best_epoch": best, "epochs": n}, diag
+    verdict, text = fit_diagnosis(hist)
+    return {"best_epoch": best, "epochs": len(val)}, f"**{verdict.capitalize()}** — {text}"
 
 
 # ── Sections 2–4: held-out test set ───────────────────────────────────────────
 
 def evaluate_test_set(ck, info, L):
     df = ml_core.prepare_dataset(ck, info["dataset"], L)
-    encoders = {c: ml_core.load_enc(ck, c) for c in L.encoder_columns}
+    columns = ml_core.load_map(ck, "features")
+    encoders = {c: ml_core.load_enc(ck, c) for c in columns}
     try:
-        X, y = ml_core.build_inputs(df, L, encoders)
+        X, y = ml_core.build_inputs(df, columns, encoders)
     except ValueError as e:
         raise RuntimeError(
             f"[{ck}] the dataset contains values the saved encoders have never seen "
@@ -193,13 +230,26 @@ def evaluate_test_set(ck, info, L):
     test = df.iloc[test_idx].copy()
     test["actual"] = y[test_idx]
     test["pred"] = pred
-    test["pred_served"] = [ml_core.floor005(p) for p in pred]   # what the app shows
 
     # Dumb baseline: mean ideal_pp of the dish's category in the TRAIN rows.
     train = df.iloc[train_idx]
     cat_mean = train.groupby("category")["ideal_pp"].mean()
     test["baseline"] = test["category"].map(cat_mean).fillna(train["ideal_pp"].mean())
     return df, train, test
+
+
+def evaluate_current(ck):
+    """Test-set results of the client's model on disk (no files written): headline metrics,
+    error per category and per weekday, and the (actual, predicted) points."""
+    _, _, test = evaluate_test_set(ck, CLIENT_DB[ck], get_logic(ck))
+    return {
+        "metrics": {**metrics(test["actual"], test["pred"]),
+                    "baseline_rmse": metrics(test["actual"], test["baseline"])["rmse"]},
+        "per_category": {c: metrics(g["actual"], g["pred"]) for c, g in test.groupby("category")},
+        "per_weekday":  {d: metrics(g["actual"], g["pred"]) for d, g in test.groupby("weekday")},
+        "points":       test[["actual", "pred", "category"]].to_dict("records"),
+        "cases":        run_cases(ck, get_logic(ck), read_frame(ensure_workbook(ck, get_logic(ck))[0], "cases")),
+    }
 
 
 def scatter_and_residuals(ck, test, out_dir):
@@ -257,11 +307,11 @@ def fixed_settings(ck, L):
         ("architecture", "(fixed) dish emb + mean co-menu emb + one emb per feature "
                          "→ Dense → Dropout → Dense → Dense(1)"),
         ("output_layer", "(fixed) Dense(1), linear — predicts ideal_pp in kg/person"),
-        ("features",     "(fixed) " + ", ".join(L.encoder_columns)),
+        ("features",     "(fixed) " + ", ".join(L.encoder_columns) + " (+ extra_features above)"),
         ("feature_emb_dims", "(fixed) " + ", ".join(f"{c}={ml_core.EMB_DIMS.get(c, 2)}" for c in feats)),
         ("ctx_len",      f"(fixed) {ml_core.CTX_LEN} co-menu dishes per row"),
         ("seed",         f"(fixed) {ml_core.SEED}"),
-        ("rounding",     "(fixed) served PP floored to 0.005 kg"),
+        ("rounding",     "(fixed) off: predictions are the raw model output (5 g rounding commented out)"),
         ("holdout",      "(fixed) every date on the cases tab is removed from training data"),
     ]
 
@@ -337,9 +387,13 @@ def parse_settings(path):
             v = sheet.at[key, name]
             if key == "dense_units":
                 params[key] = [int(float(u)) for u in str(v).split(",")]
-            elif key in ("optimizer", "loss", "activation", "target_mode"):
+            elif key == "extra_features":
+                params[key] = [f.strip() for f in str(v).split(",") if f.strip()]
+            elif key in ("mask_padding", "batch_norm"):
+                params[key] = str(v).strip().lower() in ("true", "1", "yes")
+            elif key in ("optimizer", "loss", "activation", "target_mode", "output_activation"):
                 params[key] = str(v).strip().lower()
-            elif key in ("epochs", "batch", "item_emb_dim"):
+            elif key in ("epochs", "batch", "item_emb_dim", "early_stopping", "seed"):
                 params[key] = int(float(v))
             else:
                 params[key] = float(v)
@@ -353,7 +407,9 @@ def params_text(p):
     return (f"epochs={p['epochs']}, batch={p['batch']}, lr={p['learning_rate']}, "
             f"optimizer={p['optimizer']}, loss={p['loss']}, activation={p['activation']}, "
             f"layers={','.join(str(u) for u in p['dense_units'])}, dropout={p['dropout']}, "
-            f"item_emb={p['item_emb_dim']}, target={p['target_mode']}")
+            f"item_emb={p['item_emb_dim']}, target={p['target_mode']}, mask_padding={p['mask_padding']}, batch_norm={p['batch_norm']}, output={p['output_activation']}, "
+            f"early_stopping={p['early_stopping']}, "
+            f"extra_features={','.join(p['extra_features']) or 'none'}")
 
 
 # ── Section 5: the test-case days ──────────────────────────────────────────
@@ -375,6 +431,7 @@ def run_cases(ck, L, cases):
             day_type=c["day_type"] if has(c, "day_type") else None,
             holiday_type=c["holiday_type"] if has(c, "holiday_type") else None,
             meal_day=c["meal_day"] if has(c, "meal_day") else None,
+            service_date=c["date"],
         )
         actual = float(c["ideal_pp"])
         row = {"case": n, "date": c["date"].date(), "dish": c["menu_items"],
@@ -452,11 +509,10 @@ def report_client(ck, retrain=False):
 
     # 1 — learning curves
     df, train, test = evaluate_test_set(ck, info, L)
-    fit, fit_diag = learning_curves(ck, train["ideal_pp"].to_numpy(), out_dir)
+    fit, fit_diag = learning_curves(ck, out_dir)
 
     # 2 — test-set metrics
     m      = metrics(test["actual"], test["pred"])
-    served = metrics(test["actual"], test["pred_served"])
     base   = metrics(test["actual"], test["baseline"])
     beats_base = m["rmse"] < base["rmse"]
 
@@ -487,12 +543,22 @@ def report_client(ck, retrain=False):
     if prev:
         pm = prev["metrics"]
         checks.append(("RMSE and MAPE both dropped",
-                       m["rmse"] < pm["rmse"] and m["mape"] < pm["mape"]))
-        checks.append((f"|bias| ≤ {BIAS_TOL} kg", abs(m["bias"]) <= BIAS_TOL))
-        checks.append(("no category regressed", not regressed))
-        improved = all(ok for _, ok in checks)
-        verdict = ("ACCEPT — this change improved the model." if improved else
-                   "REJECT — " + "; ".join(f"failed: {n}" for n, ok in checks if not ok) + ".")
+                       m["rmse"] < pm["rmse"] and m["mape"] < pm["mape"],
+                       f"RMSE {pm['rmse']:.4f} → {m['rmse']:.4f} and MAPE {pm['mape']:.1f}% → {m['mape']:.1f}% "
+                       "did not both drop"))
+        checks.append((f"|bias| ≤ {BIAS_TOL} kg", abs(m["bias"]) <= BIAS_TOL,
+                       f"bias {m['bias']:+.4f} kg is outside ±{BIAS_TOL}"))
+        checks.append(("no category got worse", not regressed,
+                       f"{len(regressed)} categor{'y' if len(regressed) == 1 else 'ies'} got worse: "
+                       + ", ".join(f"{c} ({prev_cat[c]['rmse']:.4f} → {per_cat[c]['rmse']:.4f})" for c in regressed)))
+        improved = all(ok for _, ok, _ in checks)
+        if m["rmse"] == pm["rmse"] and m["mape"] == pm["mape"]:
+            # Same scores to the last digit: the model was re-tested, not changed.
+            verdict = f"UNCHANGED — same model and results as run {prev['timestamp']}; nothing to accept or reject."
+        elif improved:
+            verdict = "ACCEPT — better than the previous run on every check."
+        else:
+            verdict = "REJECT — " + "; ".join(why for _, ok, why in checks if not ok) + "."
     else:
         verdict = ("FIRST RUN — baseline recorded, nothing to compare yet. Model "
                    f"{'beats' if beats_base else 'does NOT beat'} the category-mean baseline.")
@@ -513,7 +579,7 @@ def report_client(ck, retrain=False):
     w("## 1. Learning curves\n")
     if fit:
         w("![learning curves](learning_curves.png)\n")
-        w(f"{fit_diag} Best epoch: **{fit['best_epoch']}** of {fit['epochs']} trained.\n")
+        w(f"{fit_diag}\n")
     else:
         w(f"{fit_diag}\n")
 
@@ -524,11 +590,10 @@ def report_client(ck, retrain=False):
         [["RMSE (kg/person) — primary", f4(m["rmse"]), f4(pm.get("rmse")), delta(m["rmse"], pm.get("rmse")), f4(base["rmse"])],
          ["MAE (kg/person)", f4(m["mae"]), f4(pm.get("mae")), delta(m["mae"], pm.get("mae")), f4(base["mae"])],
          ["MAPE (%)", f1(m["mape"]), f1(pm.get("mape")), delta(m["mape"], pm.get("mape"), f1), f1(base["mape"])],
-         ["Bias (pred − actual)", f"{m['bias']:+.4f}", f4(pm.get("bias")), delta(m["bias"], pm.get("bias")), f"{base['bias']:+.4f}"],
-         ["RMSE as served (floored to 0.005)", f4(served["rmse"]), f4(pm.get("rmse_served")), delta(served["rmse"], pm.get("rmse_served")), "—"]]))
+         ["Bias (pred − actual)", f"{m['bias']:+.4f}", f4(pm.get("bias")), delta(m["bias"], pm.get("bias")), f"{base['bias']:+.4f}"]]))
     w("")
     w("Bias sign: **+** = over-predicts (waste), **−** = under-predicts (shortage). "
-      "Metrics use the raw model output (same as `scripts/train.py`); the last row is what the app shows.\n")
+      "Metrics use the raw model output, which is also what the app now shows (5 g rounding is off).\n")
     vs_prev = ("no previous run to compare" if not prev else
                "better" if m["rmse"] < pm["rmse"] else "worse" if m["rmse"] > pm["rmse"] else "unchanged")
     vs_prev += "" if not prev else " vs previous run"
@@ -547,6 +612,11 @@ def report_client(ck, retrain=False):
     w("")
     w(f"Regressed categories: **{', '.join(regressed) if regressed else 'none'}**"
       f"{'' if prev else ' (no previous run)'}.\n")
+    w("**By weekday**\n")
+    w(md_table(["weekday", "count", "RMSE", "MAPE %", "bias"],
+               [[day, v["n"], f4(v["rmse"]), f1(v["mape"]), f"{v['bias']:+.4f}"]
+                for day, v in ((d, metrics(g["actual"], g["pred"])) for d, g in test.groupby("weekday"))]))
+    w("")
 
     w("## 4. Predicted vs actual\n")
     w("![predicted vs actual](pred_vs_actual.png)\n")
@@ -579,7 +649,7 @@ def report_client(ck, retrain=False):
         cases_summary = None
 
     w("## 6. Final verdict\n")
-    for n, ok in checks:
+    for n, ok, _ in checks:
         w(f"- {'✅' if ok else '❌'} {n}")
     if checks:
         w("")
@@ -591,9 +661,10 @@ def report_client(ck, retrain=False):
 
     runs.append({
         "timestamp": stamp, "mode": "train" if retrain else "evaluate",
-        "metrics": {**m, "rmse_served": served["rmse"], "baseline_rmse": base["rmse"]},
+        "metrics": {**m, "baseline_rmse": base["rmse"]},
         "per_category": per_cat, "fit": fit, "cases": cases_summary,
         "verdict": verdict, "peeked": peeked,
+        "checks": [[n, ok] for n, ok, _ in checks], "previous": prev["timestamp"] if prev else None,
     })
     save_runs(ck, runs)
 
@@ -615,6 +686,29 @@ def split_text(df, params, n_case_days):
             f"({float(params['test_size']):.0%}) · test cases {n_case_days} days (never trained on)")
 
 
+def trial(ck, L, params, cases):
+    """
+    Train a throwaway model with these settings (test-case days excluded) and
+    predict every test-case dish. Returns (internal test RMSE, case rows, fit
+    history, internal test rows with "actual" and "pred"). Production artifacts
+    are never touched.
+    """
+    import shutil
+    import tempfile
+    old_dir = ml_core.ARTIFACT_DIR
+    tmp = tempfile.mkdtemp(prefix=f"{ck}_trial_")
+    try:
+        ml_core.ARTIFACT_DIR = tmp
+        ml_core._model_cache.clear()
+        _, rmse = ml_core.train_model(ck, CLIENT_DB[ck]["dataset"], L, params=params)
+        _, _, test = evaluate_test_set(ck, CLIENT_DB[ck], L)
+        return rmse, run_cases(ck, L, cases), fit_history(ck), test[["actual", "pred"]]
+    finally:
+        ml_core.ARTIFACT_DIR = old_dir
+        ml_core._model_cache.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run_settings_tests(ck):
     """
     For every Test column on the settings tab: train a temporary model with
@@ -622,14 +716,12 @@ def run_settings_tests(ck):
     write the Results / Category accuracy tables. Production artifacts are
     never touched.
     """
-    import shutil
-    import tempfile
-
     info, L = CLIENT_DB[ck], get_logic(ck)
     path, _ = ensure_workbook(ck, L)
     cases = read_frame(path, "cases")
     # Config-1 always mirrors production (model_params.json); other columns are experiments.
-    tests = [("Config-1", "production (model_params.json)", ml_core.get_params(ck))]
+    tests = [("Config-1", "production — the model the app uses now; every other config must beat it",
+              ml_core.get_params(ck))]
     tests += [t for t in parse_settings(path) if t[0] != "Config-1"]
     write_workbook(path, pd.read_excel(path, sheet_name="cases"), settings_frame(ck, L, tests))
     df = ml_core.prepare_dataset(ck, info["dataset"], L)   # case days already dropped
@@ -639,21 +731,11 @@ def run_settings_tests(ck):
     n_case_days = case_days.nunique()
 
     results, cat_rows, summary = [], [], []
-    old_dir = ml_core.ARTIFACT_DIR
     for name, label, params in tests:
         # Each result is named after its config plus when it ran, e.g. "Config-1 2026-11-03 15:53".
         test_name = f"{name} {datetime.now():%Y-%m-%d %H:%M}"
-        tmp = tempfile.mkdtemp(prefix=f"{ck}_{name}_")
-        try:
-            ml_core.ARTIFACT_DIR = tmp
-            ml_core._model_cache.clear()
-            print(f"[{ck}] {name} ({label or 'no label'}): training…")
-            _, internal_rmse = ml_core.train_model(ck, info["dataset"], L, params=params)
-            rows = run_cases(ck, L, cases)
-        finally:
-            ml_core.ARTIFACT_DIR = old_dir
-            ml_core._model_cache.clear()
-            shutil.rmtree(tmp, ignore_errors=True)
+        print(f"[{ck}] {name} ({label or 'no label'}): training…")
+        internal_rmse, rows, _, _ = trial(ck, L, params, cases)
 
         config = label or name
         split = split_text(df, params, n_case_days)
