@@ -4,22 +4,20 @@
     "batch": 32,
     "learning_rate": 0.003,
     "optimizer": "adam",
-    "loss": "mse",
+    "loss": "pseudo_huber",
+    "loss_delta": 0.005,
     "activation": "relu",
-    "item_emb_dim": 4,
+    "item_emb_dim": 8,
     "dense_units": [
-      32,
-      16
+      64,
+      32
     ],
-    "dropout": 0.5,
+    "dropout": 0.1,
+    "mask_padding": true,
     "target_mode": "category_offset",
     "val_split": 0.1,
     "test_size": 0.2,
-    "_val_rmse": 0.01853,
-    "_default_val_rmse": 0.01943,
-    "_tuned_at": "2026-11-03 16:53",
-    "_trials": 24,
-    "_chosen_at": "2026-11-03 17:43",
-    "_why": "beat the 17:31 re-tune on dataset (2): RMSE 0.0117 vs 0.0121, 15-day accuracy 85.4% vs 83.4%; epochs 5 -> 100 on 2026-11-04 (now a maximum: early stopping always on)"
+    "_chosen_at": "2026-11-06",
+    "_why": "best on all three measures, averaged over seeds 42/7/123: internal RMSE 0.0108 vs 0.0114, 15-day accuracy 87.2% vs 84.4%, within ±10% 80 vs 72 dishes (previous production: mse, dropout 0.5, item_emb 4, layers 32/16, no masking). Watch: under-predicts some Healthy Rice dishes"
   }
 }
