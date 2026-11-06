@@ -19,6 +19,15 @@ Clario test-case dishes.
 
 ---
 
+## 2026-11-06
+
+### Clario
+
+| Time | Change | Not changed | Result |
+|---|---|---|---|
+| — | **New production model.** Loss mse → **pseudo_huber, loss_delta 0.005** (5 g); layers 32/16 → **64/32**; dropout 0.5 → **0.1**; item_emb 4 → **8**; **mask_padding on**. Chosen from the grid / seed / loss-delta tests: best on all three measures averaged over seeds 42, 7, 123. | Dataset (2), 15 test days (held out: 15 days in the training log), category_offset, lr 0.003, batch 32, adam, relu, early stopping 5 (max 100), other clients | Production retrain: RMSE **0.0110** (was 0.0114), 15-day accuracy **86.6%** (was 84.4%), 73/129 within ±10% (was 72). 3-seed average: 0.0108 / 87.2% / 80. Watch: under-predicts some Healthy Rice dishes (Broken Wheat 42 g vs 100 g, Daliya Upma 40 g vs 60 g). **In production.** Roll back by restoring the previous `model_params.json` values and running `scripts/train.py --client clario --force`. |
+| — | **Settings tab: added Config-8** = the previous production model, to compare and roll back. **Fixed** a duplicate `seed` row (seed became a per-config setting but was still listed as fixed), which crashed reading the settings tab back. | Cases tab, Config-1 to Config-7 | Config-1 = the new production settings. New test `tests/test_settings_workbook.py`; 75 tests pass. |
+
 ## 2026-11-03
 
 ### Clario

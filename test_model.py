@@ -310,7 +310,6 @@ def fixed_settings(ck, L):
         ("features",     "(fixed) " + ", ".join(L.encoder_columns) + " (+ extra_features above)"),
         ("feature_emb_dims", "(fixed) " + ", ".join(f"{c}={ml_core.EMB_DIMS.get(c, 2)}" for c in feats)),
         ("ctx_len",      f"(fixed) {ml_core.CTX_LEN} co-menu dishes per row"),
-        ("seed",         f"(fixed) {ml_core.SEED}"),
         ("rounding",     "(fixed) off: predictions are the raw model output (5 g rounding commented out)"),
         ("holdout",      "(fixed) every date on the cases tab is removed from training data"),
     ]
