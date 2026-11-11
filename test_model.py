@@ -11,7 +11,7 @@ Every client has a test workbook, test_cases/<client>_test.xlsx, with two tabs:
             These dates are NEVER used for training,
             tuning or evaluation (ml_core.prepare_dataset drops them).
   settings  every model setting as a row, one column per config (Config-1, Config-2 ...).
-If the workbook is missing it is created from the dataset's last 10 days.
+If the workbook is missing it is created from the dataset's last N_DAYS (15) days.
 
 Usage:
     python test_model.py --client tekion              # evaluate current artifacts
@@ -44,12 +44,14 @@ from client_database import CLIENT_DB                        # noqa: E402
 from client_logic import get_logic                           # noqa: E402
 
 REPORT_DIR = os.path.join(_ROOT, "reports")
-N_DAYS     = 10   # days put on a new workbook's cases tab
+N_DAYS     = 15   # days put on a new workbook's cases tab
 
 # ═══ TUNING: report thresholds ════════════════════════════════════════════════
 BIAS_TOL       = 0.005   # |bias| ≤ one 5 g serving-spoon step counts as "near zero"
 CAT_REGRESS    = 0.0005  # category RMSE rise (kg) that counts as a regression
 WITHIN_PCT     = 10.0    # a case is "within tolerance" at ±10 % error
+WITHIN_G       = 5.0     # the kitchen's target: predicted within 5 g/person (one serving-spoon step) of eaten
+DAY_TARGET     = 0.70    # ... for MORE than 70% of the day's dishes (10 dishes → 8 or more)
 
 SETTING_NOTES = {
     "label":         "free-text name for this test",
@@ -66,6 +68,9 @@ SETTING_NOTES = {
     "dropout":       "fraction of layer-1 outputs dropped while training",
     "target_mode":   "raw = predict ideal_pp | category_offset = predict gap from category mean",
     "mask_padding":  "TRUE = ignore empty co-menu slots when averaging the day's menu",
+    "weight_by_mg":  "TRUE = rows count in training in proportion to client MG (big days matter more)",
+    "calibrate":     "TRUE = add each category's typical miss on the newest (validation) days to its predictions",
+    "rebase":        "TRUE = scale past rows to today's standard portions (data/<client>_standard_portions.csv)",
     "early_stopping": "always on: stop after N epochs without improvement, keep the best (epochs = maximum)",
     "extra_features": "comma list of month, month_part (early/mid/late), mg_band (headcount per 50); blank = none",
     "item_emb_dim":  "embedding width for the dish and its co-menu",
@@ -210,6 +215,8 @@ def learning_curves(ck, out_dir):
 
 def evaluate_test_set(ck, info, L):
     df = ml_core.prepare_dataset(ck, info["dataset"], L)
+    if ml_core.get_params(ck)["rebase"]:   # judged at today's standards, as it was trained
+        df = ml_core.rebase_to_standards(df, pd.read_csv(ml_core.standards_path(ck)))
     columns = ml_core.load_map(ck, "features")
     encoders = {c: ml_core.load_enc(ck, c) for c in columns}
     try:
@@ -219,36 +226,69 @@ def evaluate_test_set(ck, info, L):
             f"[{ck}] the dataset contains values the saved encoders have never seen "
             f"({e}). The dataset changed since training — run with --train."
         ) from e
-    train_idx, test_idx = ml_core.split_train_test(df, ml_core.get_params(ck)["test_size"])
+    params = ml_core.get_params(ck)
+    train_idx, test_idx = ml_core.split_train_test(df, params["test_size"])
     model = ml_core.load_model(ck)
-    pred = model.predict([a[test_idx] for a in X], verbose=0).flatten()
-    offsets = ml_core.load_offsets(ck)
-    if offsets is not None:   # category_offset model predicts the gap from the category mean
-        pred = pred + df.iloc[test_idx]["category"].map(
-            lambda c: ml_core.category_offset(offsets, c)).to_numpy(dtype=float)
+    offsets, calibration = ml_core.load_offsets(ck), ml_core.load_calibration(ck)
 
-    test = df.iloc[test_idx].copy()
-    test["actual"] = y[test_idx]
-    test["pred"] = pred
+    def predicted(idx):
+        rows = df.iloc[idx].copy()
+        rows["actual"] = y[idx]
+        rows["pred"] = model.predict([a[idx] for a in X], verbose=0).flatten()
+        if offsets is not None:   # category_offset model predicts the gap from the category mean
+            rows["pred"] += rows["category"].map(lambda c: ml_core.category_offset(offsets, c)).to_numpy(dtype=float)
+        if calibration:           # same correction predict() adds
+            rows["pred"] += rows["category"].map(lambda c: calibration.get(ml_core.token(c), 0.0)).to_numpy(dtype=float)
+        return rows
+
+    test = predicted(test_idx)
+    # Keras validation_split holds out the LAST share of the training rows; early stopping watches them.
+    val = predicted(train_idx[int(len(train_idx) * (1 - params["val_split"])):])
 
     # Dumb baseline: mean ideal_pp of the dish's category in the TRAIN rows.
     train = df.iloc[train_idx]
     cat_mean = train.groupby("category")["ideal_pp"].mean()
     test["baseline"] = test["category"].map(cat_mean).fillna(train["ideal_pp"].mean())
-    return df, train, test
+    return df, train, test, val
+
+
+def shortage_rows(frame):
+    """
+    (dishes scored, the dishes predicted more than WITHIN_PCT below what was eaten), both on the
+    app's 5 g grid, worst first. kg short = (eaten − predicted) per person × client MG.
+    """
+    f = frame.rename(columns={"menu_items": "dish", "client_mg": "mg"})
+    f = f[f["pred"].notna()]
+    eaten, pred = f["actual"].map(ml_core.round005), f["pred"].astype(float).map(ml_core.round005)
+    short = ((eaten - pred) / eaten * 100).round(6) > WITHIN_PCT
+    out = f.loc[short, ["date", "dish", "category", "mg"]].assign(
+        predicted_g=pred[short] * 1000, eaten_g=eaten[short] * 1000)
+    out["short_g"] = out["eaten_g"] - out["predicted_g"]
+    out["kg_short"] = out["short_g"] / 1000 * pd.to_numeric(out["mg"], errors="coerce")
+    return len(f), out.sort_values("kg_short", ascending=False)
 
 
 def evaluate_current(ck):
     """Test-set results of the client's model on disk (no files written): headline metrics,
-    error per category and per weekday, and the (actual, predicted) points."""
-    _, _, test = evaluate_test_set(ck, CLIENT_DB[ck], get_logic(ck))
+    error per category and per weekday, the (actual, predicted) points, the test cases, and
+    the shortages in the validation rows, the internal test set and each test-case set."""
+    _, _, test, val = evaluate_test_set(ck, CLIENT_DB[ck], get_logic(ck))
+    cases = run_cases(ck, get_logic(ck), read_frame(ensure_workbook(ck, get_logic(ck))[0], "cases"))
+    c = pd.DataFrame(cases)
+    sets = {"Validation": val, "Internal test": test,
+            **({str(t): g for t, g in c.groupby("test")} if c["test"].notna().any() else {"Test cases": c})}
+    shortages = {}
+    for name, frame in sets.items():
+        n, rows = shortage_rows(frame)
+        shortages[name] = {"dishes": n, "rows": rows.assign(date=rows["date"].astype(str)).to_dict("records")}
     return {
         "metrics": {**metrics(test["actual"], test["pred"]),
                     "baseline_rmse": metrics(test["actual"], test["baseline"])["rmse"]},
         "per_category": {c: metrics(g["actual"], g["pred"]) for c, g in test.groupby("category")},
         "per_weekday":  {d: metrics(g["actual"], g["pred"]) for d, g in test.groupby("weekday")},
         "points":       test[["actual", "pred", "category"]].to_dict("records"),
-        "cases":        run_cases(ck, get_logic(ck), read_frame(ensure_workbook(ck, get_logic(ck))[0], "cases")),
+        "cases":        cases,
+        "shortages":    shortages,
     }
 
 
@@ -310,7 +350,7 @@ def fixed_settings(ck, L):
         ("features",     "(fixed) " + ", ".join(L.encoder_columns) + " (+ extra_features above)"),
         ("feature_emb_dims", "(fixed) " + ", ".join(f"{c}={ml_core.EMB_DIMS.get(c, 2)}" for c in feats)),
         ("ctx_len",      f"(fixed) {ml_core.CTX_LEN} co-menu dishes per row"),
-        ("rounding",     "(fixed) off: predictions are the raw model output (5 g rounding commented out)"),
+        ("rounding",     "(fixed) test-case predictions and actuals rounded to the nearest 0.005 kg (5 g)"),
         ("holdout",      "(fixed) every date on the cases tab is removed from training data"),
     ]
 
@@ -388,7 +428,7 @@ def parse_settings(path):
                 params[key] = [int(float(u)) for u in str(v).split(",")]
             elif key == "extra_features":
                 params[key] = [f.strip() for f in str(v).split(",") if f.strip()]
-            elif key in ("mask_padding", "batch_norm"):
+            elif key in ("mask_padding", "batch_norm", "weight_by_mg", "calibrate", "rebase"):
                 params[key] = str(v).strip().lower() in ("true", "1", "yes")
             elif key in ("optimizer", "loss", "activation", "target_mode", "output_activation"):
                 params[key] = str(v).strip().lower()
@@ -413,36 +453,47 @@ def params_text(p):
 
 # ── Section 5: the test-case days ──────────────────────────────────────────
 
-def run_cases(ck, L, cases):
-    """Predict every dish on the cases tab with the model currently in ARTIFACT_DIR."""
+def run_cases(ck, L, cases, menus=None):
+    """
+    Predict every dish on the cases tab with the model currently in ARTIFACT_DIR.
+    menus: optional {date: co-menu list} to use instead of each day's own menu
+    (scripts/search.py swaps menus between days to check the model reads them).
+    """
     cases = cases.copy()
     cases["date"] = pd.to_datetime(cases["date"], errors="coerce")
-    menus = cases.groupby("date")["menu_items"].apply(lambda s: [str(x) for x in s])
+    if menus is None:
+        menus = cases.groupby("date")["menu_items"].apply(lambda s: [str(x) for x in s])
 
     def has(r, c):
         return c in r and not is_blank(r[c])
 
     out = []
     for n, c in enumerate(cases.to_dict("records"), 1):
-        res = ml_core.predict(   # mg=1: per-pax does not depend on headcount
-            ck, str(c["menu_items"]), menus[c["date"]], 1,
+        res = ml_core.predict(   # real headcount: the mg_band feature depends on it
+            ck, str(c["menu_items"]), menus[c["date"]], int(c["client_mg"]) if has(c, "client_mg") else 1,
             c.get("sub_category"), c.get("category"), c["date"].day_name(), L,
             day_type=c["day_type"] if has(c, "day_type") else None,
             holiday_type=c["holiday_type"] if has(c, "holiday_type") else None,
             meal_day=c["meal_day"] if has(c, "meal_day") else None,
             service_date=c["date"],
         )
-        actual = float(c["ideal_pp"])
-        row = {"case": n, "date": c["date"].date(), "dish": c["menu_items"],
+        actual = ml_core.round005(float(c["ideal_pp"]))   # same 5 g grid as the prediction
+        row = {"case": n, "test": c.get("test"), "mg": c.get("client_mg"), "date": c["date"].date(), "dish": c["menu_items"],
                "category": c["category"], "actual": actual,
-               "error": res.error, "fallback": res.fallback_item if res.fallback else None}
+               "error": res.error, "fallback": res.fallback_item if res.fallback else None,
+               "within": False, "acc": 0.0,   # a dish that cannot be predicted counts as a miss
+               "within_5g": False, "exact": False}
         if res.ok:
             pred = res.per_pax
             diff = pred - actual
             pct = diff / actual * 100 if actual > 0 else float("nan")
+            # round(): on the 5 g grid exactly-10% misses (90 g vs 100 g) come out as 10.0000001%
+            within = bool(round(abs(pct), 6) <= WITHIN_PCT) if actual > 0 else False
+            # Accuracy = dishes within ±WITHIN_PCT / all dishes, so each dish scores 100 or 0.
             row.update(pred=pred, diff=abs(diff), signed_diff=diff, signed_pct=pct,
-                       pct=abs(pct), acc=max(0.0, 100 - abs(pct)),
-                       within=(abs(pct) <= WITHIN_PCT) if actual > 0 else False)
+                       pct=abs(pct), within=within, acc=100.0 if within else 0.0,
+                       within_5g=bool(round(abs(diff) * 1000, 6) <= WITHIN_G),   # both on the 5 g grid
+                       exact=bool(round(abs(diff) * 1000, 6) == 0))
 
         out.append(row)
     return out
@@ -455,22 +506,20 @@ def day_tables(case_rows):
     for r in case_rows:
         by_day.setdefault(r["date"], []).append(r)
     for day, rows in sorted(by_day.items()):
-        ok = [r for r in rows if r.get("pred") is not None]
-        acc = f"{np.mean([r['acc'] for r in ok]):.1f}%" if ok else "n/a"
-        within = sum(r["within"] for r in ok)
-        out.append(f"### {day:%a %d %b %Y} — {len(rows)} dishes · accuracy {acc} · "
-                   f"{within}/{len(rows)} within ±{WITHIN_PCT:.0f}%\n")
+        within, w5 = sum(r["within"] for r in rows), sum(r["within_5g"] for r in rows)
+        out.append(f"### {day:%a %d %b %Y} — {len(rows)} dishes · {w5}/{len(rows)} within {WITHIN_G:.0f} g · "
+                   f"accuracy {within / len(rows) * 100:.1f}% ({within}/{len(rows)} within ±{WITHIN_PCT:.0f}%)\n")
         table = []
         for r in rows:
             if r.get("pred") is None:
-                table.append([r["dish"], r["category"], "—", f4(r["actual"]), "—", "—", "—", "—", r["error"]])
+                table.append([r["dish"], r["category"], "—", f4(r["actual"]), "—", "—", "no", "no", r["error"]])
                 continue
             note = f"fallback: {r['fallback']}" if r["fallback"] else ""
             table.append([r["dish"], r["category"], f4(r["pred"]), f4(r["actual"]),
-                          f"{r['signed_diff']:+.4f}", f"{r['signed_pct']:+.1f}", f1(r["acc"]),
-                          "yes" if r["within"] else "no", note])
+                          f"{r['signed_diff']:+.4f}", f"{r['signed_pct']:+.1f}",
+                          "yes" if r["within_5g"] else "no", "yes" if r["within"] else "no", note])
         out.append(md_table(["dish", "category", "predicted", "actual", "difference", "difference %",
-                             "accuracy %", f"within ±{WITHIN_PCT:.0f}%", "note"], table))
+                             f"within {WITHIN_G:.0f} g", f"within ±{WITHIN_PCT:.0f}%", "note"], table))
         out.append("")
     return "\n".join(out)
 
@@ -507,7 +556,7 @@ def report_client(ck, retrain=False):
     prev = runs[-1] if runs else None
 
     # 1 — learning curves
-    df, train, test = evaluate_test_set(ck, info, L)
+    df, train, test, _ = evaluate_test_set(ck, info, L)
     fit, fit_diag = learning_curves(ck, out_dir)
 
     # 2 — test-set metrics
@@ -592,7 +641,7 @@ def report_client(ck, retrain=False):
          ["Bias (pred − actual)", f"{m['bias']:+.4f}", f4(pm.get("bias")), delta(m["bias"], pm.get("bias")), f"{base['bias']:+.4f}"]]))
     w("")
     w("Bias sign: **+** = over-predicts (waste), **−** = under-predicts (shortage). "
-      "Metrics use the raw model output, which is also what the app now shows (5 g rounding is off).\n")
+      "Metrics use the raw model output; the app and the test cases round it to the nearest 5 g.\n")
     vs_prev = ("no previous run to compare" if not prev else
                "better" if m["rmse"] < pm["rmse"] else "worse" if m["rmse"] > pm["rmse"] else "unchanged")
     vs_prev += "" if not prev else " vs previous run"
@@ -631,16 +680,23 @@ def report_client(ck, retrain=False):
           f"honest — retrain (`python scripts/train.py --client {ck} --force`).\n")
     w(day_tables(case_rows))
     if ok_rows:
-        cdf = pd.DataFrame(ok_rows)
-        g = cdf.groupby("category").agg(n=("diff", "size"), avg_diff=("diff", "mean"), avg_acc=("acc", "mean"))
+        cdf = pd.DataFrame(case_rows)
+        g = cdf.groupby("category").agg(n=("acc", "size"), avg_diff=("diff", "mean"), avg_acc=("acc", "mean"))
         w("### All days, by category\n")
-        w(md_table(["category", "cases", "avg diff (kg)", "avg accuracy %"],
+        w(md_table(["category", "cases", "avg diff (kg)", f"accuracy % (within ±{WITHIN_PCT:.0f}%)"],
                    [[c, int(v.n), f4(v.avg_diff), f1(v.avg_acc)] for c, v in g.iterrows()]))
         w("")
         within_n = int(cdf["within"].sum())
-        w(f"**OVERALL:** avg diff {cdf['diff'].mean():.4f} kg · avg accuracy {cdf['acc'].mean():.1f}% · "
-          f"{within_n} of {len(case_rows)} within ±{WITHIN_PCT:.0f}% "
-          f"({len(case_rows) - len(ok_rows)} could not be predicted).\n")
+        w(f"**OVERALL:** avg diff {cdf['diff'].mean():.4f} kg · accuracy {cdf['acc'].mean():.1f}% "
+          f"({within_n} of {len(case_rows)} within ±{WITHIN_PCT:.0f}%; "
+          f"{len(case_rows) - len(ok_rows)} could not be predicted).\n")
+        days_ok = (cdf.groupby("date")["within_5g"].mean() > DAY_TARGET)
+        w(f"**Within {WITHIN_G:.0f} g (the kitchen's target):** {int(cdf['within_5g'].sum())} of {len(cdf)} dishes "
+          f"({cdf['within_5g'].mean():.0%}), {int(cdf['exact'].sum())} exact · more than {DAY_TARGET:.0%} of the "
+          f"day's dishes within {WITHIN_G:.0f} g on {int(days_ok.sum())} of {len(days_ok)} days.\n")
+        if cdf["test"].notna().any():   # cases tab holds several test sets
+            w(" · ".join(f"**{t}:** {int(g['within_5g'].sum())}/{len(g)} within {WITHIN_G:.0f} g, "
+                         f"{g['acc'].mean():.1f}% within ±{WITHIN_PCT:.0f}%" for t, g in cdf.groupby("test")) + "\n")
         cases_summary = {"avg_diff": float(cdf["diff"].mean()), "avg_acc": float(cdf["acc"].mean()),
                          "within": within_n}
     else:
@@ -700,7 +756,7 @@ def trial(ck, L, params, cases):
         ml_core.ARTIFACT_DIR = tmp
         ml_core._model_cache.clear()
         _, rmse = ml_core.train_model(ck, CLIENT_DB[ck]["dataset"], L, params=params)
-        _, _, test = evaluate_test_set(ck, CLIENT_DB[ck], L)
+        _, _, test, _ = evaluate_test_set(ck, CLIENT_DB[ck], L)
         return rmse, run_cases(ck, L, cases), fit_history(ck), test[["actual", "pred"]]
     finally:
         ml_core.ARTIFACT_DIR = old_dir
@@ -754,13 +810,14 @@ def run_settings_tests(ck):
         for cat, g in frame.groupby("category", sort=True):
             p = g[g["pred"].notna()] if "pred" in g else g.iloc[0:0]
             cat_rows.append({"Test": test_name, "Category": cat, "Dishes": len(g), "Predicted": len(p),
-                             "Accuracy %": round(float(p["acc"].mean()), 1) if len(p) else None})
+                             "Accuracy %": round(float(g["acc"].mean()), 1)})
         p = frame[frame["pred"].notna()] if "pred" in frame else frame.iloc[0:0]
-        overall = round(float(p["acc"].mean()), 1) if len(p) else None
+        overall = round(float(frame["acc"].mean()), 1)
         cat_rows.append({"Test": test_name, "Category": "ALL", "Dishes": len(frame), "Predicted": len(p),
                          "Accuracy %": overall})
         summary.append((test_name, config, split, ptxt, internal_rmse, overall, len(p), len(frame)))
-        print(f"[{ck}] {test_name}: accuracy {overall}% on {len(p)}/{len(frame)} predictable dishes "
+        print(f"[{ck}] {test_name}: accuracy {overall}% within ±{WITHIN_PCT:.0f}% of {len(frame)} dishes "
+              f"({len(p)} predictable) "
               f"(internal test RMSE {internal_rmse:.4f})")
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -768,7 +825,7 @@ def run_settings_tests(ck):
     os.makedirs(out_dir, exist_ok=True)
     res_df, cat_df = pd.DataFrame(results), pd.DataFrame(cat_rows)
     # Per-day accuracy, and one sheet per test-case day (all configs side by side).
-    res_df["_acc"] = (100 - res_df["Difference %"].abs()).clip(lower=0)
+    res_df["_acc"] = (res_df["Difference %"].abs() <= WITHIN_PCT) * 100.0   # unpredicted (NaN) → miss
     day_df = (res_df.groupby(["Test", "Date"], sort=True)
               .agg(Dishes=("Item", "size"), Predicted=("Predicted", "count"),
                    **{"Accuracy %": ("_acc", "mean")})
@@ -789,7 +846,7 @@ def run_settings_tests(ck):
 
     md = [f"# Settings tests — {info['name']} ({stamp})\n",
           f"Cases: `{os.path.relpath(path, _ROOT)}` · {n_case_days} days, {len(cases)} dishes. "
-          "Accuracy % = 100 − |difference %| (floored at 0), averaged over predictable dishes.\n",
+          f"Accuracy % = dishes within ±{WITHIN_PCT:.0f}% of actual / all dishes (unpredicted = miss).\n",
           md_table(["Test", "Config used", "Train/Val/Test split", "Parameters",
                     "internal test RMSE", "case accuracy %", "predictable"],
                    [[n, c, sp, pt, f4(rm), f1(acc), f"{k}/{t}"] for n, c, sp, pt, rm, acc, k, t in summary]),
@@ -809,7 +866,7 @@ def run_settings_tests(ck):
     md += ["## Category accuracy\n",
            md_table(["Test", "Category", "Dishes", "Predicted", "Accuracy %"],
                     [[r["Test"], r["Category"], r["Dishes"], r["Predicted"],
-                      "not predictable" if r["Accuracy %"] is None else f1(r["Accuracy %"])]
+                      f1(r["Accuracy %"])]
                      for r in cat_rows]), ""]
     with open(os.path.join(out_dir, "tests.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(md))

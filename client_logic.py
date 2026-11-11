@@ -160,6 +160,12 @@ class BaseLogic(ABC):
 
     @property
     def category_map(self): return {}
+    # Dish spellings that are the same dish → one name, so its history is not split in two.
+    @property
+    def dish_map(self): return {}
+    # Dish → (category, sub-category) where some rows logged it under the wrong one.
+    @property
+    def dish_category_map(self): return {}
     @property
     def day_type_map(self): return {"regular":"regular","previous day of holiday":"previous day of holiday","next day of holiday":"next day of holiday","holiday":"holiday"}
     @property
@@ -168,6 +174,7 @@ class BaseLogic(ABC):
     def meal_day_map(self): return {"veg":"veg","nonveg":"nonveg","non-veg":"nonveg","non veg":"nonveg"}
 
     def canonicalize_category(self,s): n=norm(s); return self.category_map.get(n,n)
+    def canonicalize_dish(self,s): n=norm(s); return self.dish_map.get(n,n)
     def canonicalize_day_type(self,s): n=norm(s); return self.day_type_map.get(n,n)
     def canonicalize_holiday_type(self,s): n=norm(s); return self.holiday_type_map.get(n,n)
     def canonicalize_meal_day(self,s): n=norm(s); return self.meal_day_map.get(n,n)
@@ -296,6 +303,38 @@ class ClarioLogic(BaseLogic):
             "sambar":"sambar/rasam",
             "sambar/rasam":"sambar/rasam",
             "rasam":"sambar/rasam",
+        }
+    @property
+    def dish_map(self):
+        # Confirmed by the kitchen 2026-11-11 as the same dish; mapped to the correct spelling.
+        # (paneer butter masala and paneer mutter masala are different dishes: not merged.)
+        return {
+            "alesunde kalu sambar":"alasande kalu sambar",
+            "allesunde kalu sambar":"alasande kalu sambar",
+            "awaidi veg biryani":"awadhi veg biryani",
+            "nawadi veg biryani":"awadhi veg biryani",
+            "baalekayi baji":"balekayi bajji",
+            "babycorn capcicum tawa fry":"babycorn capsicum tawa fry",
+            "babycorn capsicum tawa dry":"babycorn capsicum tawa fry",
+            "blackgrape curd rice":"black grape curd rice",
+            "boonda soup":"bonda soup",
+            "drumstic sambar":"drumstick sambar",
+            "greenmoong ridgegourd masala":"green moong ridgegourd masala",
+            "gujarathi kadi":"gujarati kadi",
+            "mcucumber sambar":"m cucumber sambar",
+            "majjigehuli":"majjige huli",
+            "mashroom kadai":"mushroom kadai",
+            "pundina veg pulao":"pudina veg pulao",
+            "toordal fry":"toor dal fry",
+            "toordal tadka":"toor dal tadka",
+        }
+    @property
+    def dish_category_map(self):
+        # Kitchen-confirmed 2026-11-11 (each was logged under two categories).
+        return {
+            "gujarati kadi":        ("dal", "north dal"),
+            "alasande kalu sambar": ("sambar/rasam", "traditional sambar"),
+            "bonda soup":           ("veg dry", "south veg dry"),
         }
 
     @property

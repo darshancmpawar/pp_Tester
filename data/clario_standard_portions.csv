@@ -1,0 +1,15 @@
+category,weekday,grams,note
+indian bread,,66,"provisional: kitchen standard 60 g, served 66 g since 2026 - decision pending"
+veg gravy,,120,
+veg dry,,100,
+flavoured rice,,150,
+healthy rice,,60,
+healthy rice,wednesday,120,"provisional: kitchen standard 100 g, served 120 g since Apr 2026 - decision pending"
+sambar/rasam,,60,
+dal,,70,
+white rice,,100,
+non-veg biryani,,350,
+non-veg gravy,,180,
+non-veg dry,,150,
+welcome drink,,100,not predicted (not in the dataset)
+salad,,60,not predicted (not in the dataset)

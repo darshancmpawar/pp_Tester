@@ -29,7 +29,7 @@ from client_database import CLIENT_LIST, name_to_key, get_info
 from client_logic import get_logic
 from ml_core import (
     ARTIFACT_DIR, artifacts_exist, load_map, norm, fmt_cols, stale_reasons,
-    cats_match, get_nv_cats, predict,
+    cats_match, get_nv_cats, predict, test_workbook_path,
 )
 from planner import (
     build_row, client_plan, fixed_pp_client_plan, vendor_plan,
@@ -741,8 +741,8 @@ def _metric_frame(per_segment, label):
 
 
 @st.cache_data(show_spinner="Checking the current model…", max_entries=20)
-def _live_evaluation(client_key, model_mtime):
-    """Test-set results of the model on disk; model_mtime in the key re-runs it after a retrain."""
+def _live_evaluation(client_key, model_mtime, cases_mtime):
+    """Test-set results of the model on disk; the mtimes in the key re-run it after a retrain or new test cases."""
     return test_model.evaluate_current(client_key)
 
 
@@ -795,7 +795,9 @@ def _render_model_test_section():
     model_time = os.path.getmtime(os.path.join(ARTIFACT_DIR, f"{CLIENT_KEY}_per_pax_tf_model.keras"))
     try:
         with predict_gate():
-            ev = _live_evaluation(CLIENT_KEY, model_time)
+            cases_path = test_workbook_path(CLIENT_KEY)
+            ev = _live_evaluation(CLIENT_KEY, model_time,
+                                  os.path.getmtime(cases_path) if os.path.exists(cases_path) else 0)
     except GateBusy as gate_busy:
         st.warning(str(gate_busy))
         return
@@ -864,26 +866,62 @@ def _render_model_test_section():
     cases = pd.DataFrame(ev["cases"])
     ok = cases[cases["pred"].notna()] if "pred" in cases else cases.iloc[0:0]
     st.markdown(f"#### {cases['date'].nunique()}-day test cases — production model, {len(cases)} dishes")
-    st.caption(f"Overall: accuracy {ok['acc'].mean():.1f}% · {int(ok['within'].sum())} of {len(cases)} dishes "
-               f"within ±{test_model.WITHIN_PCT:.0f}% · {len(cases) - len(ok)} could not be predicted.")
-    by_day = (ok.groupby("date")["acc"].mean().rename("Accuracy %").reset_index()
+    g5 = f"{test_model.WITHIN_G:.0f} g"
+    day_share = cases.groupby("date")["within_5g"].mean()
+    target = test_model.DAY_TARGET
+    st.caption(f"Target: within {g5} for more than {target:.0%} of the day's dishes. Overall: "
+               f"{int(cases['within_5g'].sum())} of {len(cases)} dishes within {g5} ({cases['within_5g'].mean():.0%}), "
+               f"{int(cases['exact'].sum())} exact; target met on {int((day_share > target).sum())} of {len(day_share)} days · "
+               f"within ±{test_model.WITHIN_PCT:.0f}%: {cases['acc'].mean():.1f}% · "
+               f"{len(cases) - len(ok)} could not be predicted.")
+    if cases["test"].notna().any():   # cases tab holds several test sets
+        st.caption(" · ".join(f"**{t}:** {int(g['within_5g'].sum())}/{len(g)} within {g5}, "
+                              f"{g['acc'].mean():.1f}% within ±{test_model.WITHIN_PCT:.0f}%"
+                              for t, g in cases.groupby("test")))
+    by_day = ((day_share * 100).rename(f"Within {g5} %").reset_index()
               .assign(Day=lambda d: pd.to_datetime(d["date"]).dt.strftime("%a %d %b")))
-    chart = _bar_chart(by_day, "Accuracy %", "Day", "Accuracy % by day")
+    chart = _bar_chart(by_day, f"Within {g5} %", "Day", f"Dishes within {g5}, % of the day (dashed = {target:.0%} target)",
+                       target=100 * target)
     st.altair_chart(chart, width="stretch", height=chart.height)
     for day, rows in cases.groupby("date", sort=True):
-        day_ok = rows[rows["pred"].notna()]
-        st.markdown(f"**{pd.Timestamp(day):%a %d %b %Y}** — {len(rows)} dishes · accuracy "
-                    f"{day_ok['acc'].mean():.1f}% · {int(day_ok['within'].sum())}/{len(rows)} "
-                    f"within ±{test_model.WITHIN_PCT:.0f}%")
+        st.markdown(f"**{pd.Timestamp(day):%a %d %b %Y}** — {len(rows)} dishes · "
+                    f"{int(rows['within_5g'].sum())}/{len(rows)} within {g5} · accuracy "
+                    f"{rows['acc'].mean():.1f}% ({int(rows['within'].sum())}/{len(rows)} "
+                    f"within ±{test_model.WITHIN_PCT:.0f}%)")
         st.dataframe(pd.DataFrame({
             "Dish": rows["dish"], "Category": rows["category"], "Predicted": rows["pred"],
             "Actual": rows["actual"], "Difference": rows.get("signed_diff"),
-            "Difference %": rows.get("signed_pct"), "Accuracy %": rows.get("acc"),
+            "Difference %": rows.get("signed_pct"),
+            f"Within {g5}": rows.get("within_5g").map({True: "yes", False: "no"}),
             f"Within ±{test_model.WITHIN_PCT:.0f}%": rows.get("within").map({True: "yes", False: "no"}),
             "Note": [f"fallback: {f}" if f else (e or "") for f, e in zip(rows["fallback"], rows["error"])],
         }).style.format({"Predicted": "{:.4f}", "Actual": "{:.4f}", "Difference": "{:+.4f}",
-                         "Difference %": "{:+.1f}", "Accuracy %": "{:.1f}"}, na_rep="—"),
+                         "Difference %": "{:+.1f}"}, na_rep="—"),
             width="stretch", hide_index=True)
+
+    # ── Shortages: validation, internal test, test cases ────────────────
+    st.markdown("#### Shortages — validation, internal test and test cases")
+    st.caption(f"A shortage = predicted more than {test_model.WITHIN_PCT:.0f}% below what was eaten "
+               "(both rounded to 5 g, as the app serves). kg short = the gap per person × client MG. "
+               "A calibrated model's correction is measured on the validation rows, so those rows flatter it.")
+    shortages = ev["shortages"]
+    st.dataframe(pd.DataFrame([{
+        "Set": name, "Dishes": s["dishes"], "Shortages": len(s["rows"]),
+        "Shortage %": 100 * len(s["rows"]) / s["dishes"] if s["dishes"] else None,
+        "kg short": sum(r["kg_short"] for r in s["rows"] if r["kg_short"] == r["kg_short"]),
+    } for name, s in shortages.items()]).style.format({"Shortage %": "{:.1f}", "kg short": "{:.1f}"}, na_rep="—"),
+        width="stretch", hide_index=True)
+    for tab, (name, s) in zip(st.tabs(list(shortages)), shortages.items()):
+        with tab:
+            if not s["rows"]:
+                st.caption("No shortages.")
+                continue
+            st.dataframe(pd.DataFrame(s["rows"]).rename(columns={
+                "date": "Date", "dish": "Dish", "category": "Category", "mg": "Client MG",
+                "predicted_g": "Predicted g", "eaten_g": "Eaten g", "short_g": "Short g/person",
+                "kg_short": "kg short"}).style.format({"Predicted g": "{:.0f}", "Eaten g": "{:.0f}",
+                "Short g/person": "{:.0f}", "kg short": "{:.2f}"}, na_rep="—"),
+                width="stretch", hide_index=True)
 
     # ── 6. Verdict ──────────────────────────────────────────────────────
     st.markdown("#### 6. Verdict — this model vs the previous Run Model Test")

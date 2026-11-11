@@ -12,3 +12,5 @@ __pycache__/
 # Local Python environment and generated output (recreated by test_model.py).
 .venv/
 reports/
+# Excel's lock file while a workbook is open
+~$*
