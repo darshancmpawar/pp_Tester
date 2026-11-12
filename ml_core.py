@@ -4,7 +4,7 @@ ML Core — dynamic model training + prediction for any client's feature schema.
 The model architecture is built dynamically from the client's encoder_columns list.
 All artifacts are prefixed with the client key (e.g. tekion_per_pax_tf_model.keras).
 """
-import os, math, random
+import os, random
 from collections import defaultdict
 import numpy as np, pandas as pd, tensorflow as tf, joblib
 from sklearn.preprocessing import LabelEncoder
@@ -23,10 +23,11 @@ os.makedirs(ARTIFACT_DIR, exist_ok=True)
 # constants in this block are shared by every client (changing them changes the
 # data pipeline or the test split). The per-client knobs — epochs, batch size,
 # learning rate, head size, dropout, item embedding width — live in
-# model_params.json, written by `python scripts/tune.py`. A client missing
-# from that file trains with DEFAULT_PARAMS. After editing it, run
-# `python scripts/train.py`: it retrains exactly the clients whose settings,
-# dataset or test-case days changed since their last training (stale_reasons).
+# model_params.json, edited by hand from what `python scripts/search.py` finds.
+# A client missing from that file trains with DEFAULT_PARAMS. After editing it,
+# run `python scripts/train.py`: it retrains exactly the clients whose settings,
+# dataset, standard portions or test-case days changed since their last training
+# (stale_reasons).
 
 SEED       = 42   # fixed so two runs on the same dataset give the same model
 CTX_LEN    = 10   # max co-menu items kept as context per row. A full menu is
@@ -52,10 +53,6 @@ DEFAULT_PARAMS = {
     # learn the small per-dish/per-day adjustment, not the category's scale.
     "target_mode":   "raw",
     "mask_padding":  False,     # ignore pad slots when averaging the co-menu (build_model)
-    "batch_norm":    False,     # BatchNormalization after each hidden Dense, before its activation
-    # Output layer: linear, or softplus (always > 0). softplus only suits target_mode "raw":
-    # category_offset predicts a gap from the category mean, which is often negative.
-    "output_activation": "linear",
     # Random starting weights only; the train/test split always uses SEED, so runs stay comparable.
     "seed":          SEED,
     # Switch point of huber / pseudo_huber, kg. Errors below it are treated like MSE
@@ -65,9 +62,17 @@ DEFAULT_PARAMS = {
     # better validation loss and keeps the weights from the best epoch. Those extra
     # epochs also show on the learning curve, proving the kept epoch is the best.
     "early_stopping": 5,
-    # Optional features derived from each row's date and headcount (see
-    # derive_extra_features): any of "month", "month_part", "mg_band".
-    "extra_features": [],
+    # TRUE: after training, each category's typical miss on the validation rows (the newest
+    # training days) is added to its predictions, so the model follows the current standard
+    # portion instead of a blend of old and new ones. See category_calibration.
+    "calibrate":     False,
+    # TRUE: before training, every row is scaled to TODAY's standard portion for its
+    # category (data/<client>_standard_portions.csv): × today's standard ÷ the standard
+    # in force that month. Recomputed at every retrain. See rebase_to_standards.
+    "rebase":        False,
+    # How many models are trained (same data, different random starts) and averaged.
+    # Averaging cancels each model's random quirks: steadier, and it cannot overfit more.
+    "ensemble":      1,
     "val_split":     VAL_SPLIT,
     "test_size":     TEST_SIZE,
 }
@@ -89,25 +94,10 @@ def holdout_dates(ck):
     dates = pd.to_datetime(pd.read_excel(path, sheet_name="cases")["date"], errors="coerce")
     return set(dates.dropna().dt.normalize())
 
-EXTRA_FEATURES = ("month", "month_part", "mg_band")
-
-def month_part(day):
-    """Day of month as early (1-10) / mid (11-20) / late (21-31); 31 exact days are too sparse."""
-    return "early" if day <= 10 else "mid" if day <= 20 else "late"
-
-def mg_band(mg):
-    """Expected headcount in bands of 50 heads, e.g. 137 → "100"."""
-    return str(int(mg) // 50 * 50)
-
-def model_columns(logic, params):
-    """Feature columns a model with these settings is trained on, in input order."""
-    return list(logic.encoder_columns) + list(params["extra_features"])
-
 PARAM_CHOICES = {
     "optimizer":   ("adam", "adamw", "rmsprop", "sgd"),
     "loss":        ("mse", "mae", "huber", "pseudo_huber"),
     "activation":  ("relu", "leaky_relu", "elu", "gelu", "tanh"),
-    "output_activation": ("linear", "softplus"),
     "target_mode": ("raw", "category_offset"),
 }
 
@@ -125,22 +115,14 @@ def validate_params(params, where):
                                            and params["early_stopping"] >= 1):
         raise ValueError(f"{where}: early_stopping={params['early_stopping']!r} — must be a whole "
                          "number of epochs, 1 or more (early stopping is always on).")
-    if "extra_features" in params and not (isinstance(params["extra_features"], list)
-                                           and set(params["extra_features"]) <= set(EXTRA_FEATURES)):
-        raise ValueError(f"{where}: extra_features={params['extra_features']!r} — must be a list "
-                         f"drawn from {list(EXTRA_FEATURES)}.")
-    if params.get("output_activation") == "softplus" and params.get("target_mode") == "category_offset":
-        raise ValueError(f"{where}: output_activation softplus cannot predict the negative gaps "
-                         "category_offset needs; use target_mode raw.")
     if "loss_delta" in params and not params["loss_delta"] > 0:
         raise ValueError(f"{where}: loss_delta={params['loss_delta']!r} — must be above 0 (kg).")
     if "seed" in params and not (isinstance(params["seed"], int) and params["seed"] >= 0):
         raise ValueError(f"{where}: seed={params['seed']!r} — must be a whole number, 0 or more.")
-    if "batch_norm" in params and not isinstance(params["batch_norm"], bool):
-        raise ValueError(f"{where}: batch_norm={params['batch_norm']!r} — must be true or false.")
-    if "mask_padding" in params and not isinstance(params["mask_padding"], bool):
-        raise ValueError(f"{where}: mask_padding={params['mask_padding']!r} — must be true or false.")
-    for k in ("epochs", "batch", "item_emb_dim"):
+    for k in ("mask_padding", "calibrate", "rebase"):
+        if k in params and not isinstance(params[k], bool):
+            raise ValueError(f"{where}: {k}={params[k]!r} — must be true or false.")
+    for k in ("epochs", "batch", "item_emb_dim", "ensemble"):
         if k in params and not (isinstance(params[k], int) and params[k] > 0):
             raise ValueError(f"{where}: {k}={params[k]!r} — must be a whole number above 0.")
     if "dense_units" in params and not (isinstance(params["dense_units"], list) and len(params["dense_units"]) == 2
@@ -168,6 +150,52 @@ def file_sha(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()[:12]
 
+def standards_path(ck):
+    """The kitchen's standard portions: category, weekday (blank = every day), grams, note."""
+    return os.path.join(os.path.dirname(__file__), "data", f"{ck}_standard_portions.csv")
+
+def data_sha(ck, dataset_path, params):
+    """Fingerprint of what the model learns from: the dataset, plus the standards when rebase is on,
+    so editing either marks the model out of date."""
+    sha = file_sha(dataset_path)
+    return f"{sha}+{file_sha(standards_path(ck))}" if params.get("rebase") else sha
+
+NONVEG_DAY_ORDER = ("non-veg biryani", "non-veg gravy", "non-veg dry")   # the kitchen plans around the first
+
+def day_kind(categories):
+    """What kind of menu day it is: the non-veg category on the menu (exactly the one picked in the
+    app; on a day with two, the first in NONVEG_DAY_ORDER), else "veg". The kitchen plans portions
+    by it, e.g. White Rice 70 g on biryani days against 100 g otherwise."""
+    cats = {token(c) for c in categories}
+    return next((k for k in NONVEG_DAY_ORDER if k in cats),   # other spellings, e.g. Tekion's "non veg curry":
+                next((c for c in sorted(cats) if c.replace(" ", "-").startswith("non-veg")), "veg"))
+
+def rebase_to_standards(df, standards):
+    """
+    Scale each row's ideal_pp to today's standard portion: × today's standard ÷ the
+    standard in force that month, taken as the month's median cooked portion (per_pax)
+    for the same category and kind of day. The table's `day` column picks the row: a kind of
+    day (day_kind, e.g. "non-veg biryani"), a weekday name, or blank (every other day). A 2025
+    Dal day at the old 50 g standard therefore counts as a 70 g day, and a biryani day is scaled
+    by the biryani-day standard. Categories without a standard keep their rows unchanged.
+    """
+    if "per_pax" not in df.columns:
+        raise ValueError("rebase needs the per_pax (cooked per person) column in the dataset.")
+    std = standards.assign(category=standards["category"].map(norm),
+                           day=standards["day"].fillna("").astype(str).map(norm))
+    grams = {(c, d): g / 1000.0 for c, d, g in zip(std["category"], std["day"], std["grams"])}
+    df = df.copy()
+    kind = df["date"].map(df.groupby("date")["category"].apply(day_kind))
+    # the most specific row that applies: the kind of day, then the weekday, then every day
+    wd = pd.Series([k if (c, k) in grams else w if (c, w) in grams else ""
+                    for c, w, k in zip(df["category"], df["weekday"], kind)], index=df.index)
+    today = pd.Series([grams.get((c, w)) for c, w in zip(df["category"], wd)], index=df.index, dtype=float)
+    cooked = pd.to_numeric(df["per_pax"], errors="coerce")
+    then = cooked.groupby([df["category"], wd, df["date"].dt.to_period("M")]).transform("median")
+    factor = (today / then).where(lambda f: np.isfinite(f) & (f > 0), 1.0)
+    df["ideal_pp"] = df["ideal_pp"] * factor
+    return df
+
 def stale_reasons(ck, dataset_path):
     """
     Why the trained model no longer matches its inputs: a list such as
@@ -186,11 +214,12 @@ def stale_reasons(ck, dataset_path):
     last, reasons = rows[-1], []
     # A setting added after that run is logged as absent; it trained with the default.
     trained = {**DEFAULT_PARAMS, **json.loads(last["params"])}
-    for k, v in get_params(ck).items():
+    params = get_params(ck)
+    for k, v in params.items():
         if json.dumps(trained.get(k)) != json.dumps(v):
             reasons.append(f"{k} {trained.get(k)}→{v}")
-    if last["dataset_sha"] != file_sha(dataset_path):
-        reasons.append("dataset changed")
+    if last["dataset_sha"] != data_sha(ck, dataset_path, params):
+        reasons.append("dataset or standard portions changed")
     if last.get("holdout", "") != ",".join(sorted(str(d.date()) for d in holdout_dates(ck))):
         reasons.append("test-case days changed")
     return reasons
@@ -203,7 +232,6 @@ def stale_reasons(ck, dataset_path):
 #   category      ~10                  → 4
 #   weekday       5–7                  → 2
 #   day_type      4, holiday_type 4, meal_day 2 → 2
-#   month 12 → 3,  month_part 3 → 2,  mg_band ~5-20 → 3
 # A column missing from this dict falls back to 2 (see the model builder).
 EMB_DIMS = {
     "sub_category": 4,
@@ -212,9 +240,6 @@ EMB_DIMS = {
     "day_type":     2,
     "holiday_type": 2,
     "meal_day":     2,
-    "month":        3,
-    "month_part":   2,
-    "mg_band":      3,
 }
 
 
@@ -233,15 +258,15 @@ def token(v):
 def cats_match(a, b):
     return a is not None and b is not None and norm(a) == norm(b)
 
-def floor005(v):
+def round005(v):
     """
-    Round DOWN to the nearest 0.005 kg — the per-pax output granularity.
+    Round to the nearest 0.005 kg — the per-pax output granularity. 5 g is the
+    finest difference a serving spoon can hold; see the matching note in planner.py.
 
-    Down, not nearest: the vendor bump in planner.py is what adds the safety
-    margin, so the client-facing PP stays conservative. 5 g is the finest
-    difference a serving spoon can hold; see the matching note in planner.py.
+    Nearest, not down: on the Clario test days rounding down put fewer dishes
+    within ±10% and made under-predicted dishes (shortages) worse.
     """
-    return math.floor(v / 0.005) * 0.005
+    return round(v * 200) / 200.0   # ×200 == ÷0.005, same as planner.round_to_005
 
 def fmt_cols(df, cols):
     df = df.copy()
@@ -294,12 +319,22 @@ def _load_cached(cache_key, path, loader_fn):
             _model_cache[cache_key] = (mtime, loader_fn())
     return _model_cache[cache_key][1]
 
-def load_model(ck):
-    # TensorFlow Keras model — the heavy artifact, loaded once per client.
-    path = _ap(ck, "per_pax_tf_model.keras")
+def model_file(i):
+    """Model i of an ensemble: per_pax_tf_model.keras, then per_pax_tf_model_2.keras, ..."""
+    return "per_pax_tf_model.keras" if i == 1 else f"per_pax_tf_model_{i}.keras"
+
+def load_models(ck):
+    # TensorFlow Keras models — the heavy artifacts, loaded once per client. Predictions
+    # average all of them (one for a single model, `ensemble` of them otherwise).
     # compile=False: prediction never needs the training loss, so any loss (e.g. a
     # pseudo_huber with a custom delta) loads without being registered with Keras.
-    return _load_cached(f"{ck}:mdl", path, lambda: tf.keras.models.load_model(path, compile=False))
+    models, i = [], 1
+    while i == 1 or os.path.exists(_ap(ck, model_file(i))):
+        path = _ap(ck, model_file(i))
+        models.append(_load_cached(f"{ck}:mdl{i}", path,
+                                   lambda p=path: tf.keras.models.load_model(p, compile=False)))
+        i += 1
+    return models
 
 def load_enc(ck, col):
     # LabelEncoder for a single feature column.
@@ -320,6 +355,21 @@ def load_offsets(ck):
 def category_offset(offsets, category):
     """Training-row mean for this category, or the overall mean if unseen."""
     return offsets.get(token(category), offsets["__all__"])
+
+def load_calibration(ck):
+    # category → kg added to every prediction, present only for a model trained with calibrate.
+    path = _ap(ck, "calibration.pkl")
+    return _load_cached(f"{ck}:calibration", path,
+                        lambda: joblib.load(path) if os.path.exists(path) else None)
+
+CALIBRATION_SHRINK = 10   # rows: a category seen n times moves n/(n+10) of its median miss
+
+def category_calibration(residuals, categories, shrink=CALIBRATION_SHRINK):
+    """Median miss (eaten − predicted, kg) per category, shrunk toward 0 by n/(n+shrink)
+    so a category with only a few validation rows barely moves."""
+    g = pd.Series(np.asarray(residuals, dtype=float)).groupby(np.asarray(categories))
+    med, n = g.median(), g.size()
+    return {k: float(med[k] * n[k] / (n[k] + shrink)) for k in med.index}
 
 
 # ── Safe label encoding ───────────────────────────────────────────────────────
@@ -378,6 +428,7 @@ def load_dataset(ck, path, logic):
     # Each client may use different spellings/casing for categories and day types.
     # The logic object provides canonical forms so the encoder sees consistent tokens.
     canonicalise = {
+        "menu_items":   logic.canonicalize_dish,
         "category":     logic.canonicalize_category,
         "day_type":     logic.canonicalize_day_type,
         "holiday_type": logic.canonicalize_holiday_type,
@@ -386,6 +437,14 @@ def load_dataset(ck, path, logic):
     for col in ["menu_items", "sub_category", "category", "day_type", "holiday_type", "meal_day", "meal_type"]:
         if col in df.columns:
             df[col] = df[col].map(canonicalise.get(col, norm))
+    # Dishes logged under the wrong category on some days → the kitchen's category.
+    for dish, (cat, sub) in getattr(logic, "dish_category_map", {}).items():
+        rows = df["menu_items"] == dish
+        df.loc[rows, "category"] = cat
+        if "sub_category" in df.columns:
+            df.loc[rows, "sub_category"] = sub
+    if getattr(logic, "meal_day_from_menu", False):   # veg or the day's non-veg category, from its own menu
+        df["meal_day"] = df["date"].map(df.groupby("date")["category"].apply(day_kind))
     return df
 
 def build_cat_to_subs(item_to_cat, item_to_subcat):
@@ -457,11 +516,6 @@ def prepare_dataset(ck, path, logic):
 
     # Derive weekday from date (not stored in most datasets).
     df["weekday"] = df["date"].dt.day_name().map(norm)
-    # Candidate extra features (used only when listed in extra_features).
-    df["month"] = df["date"].dt.month_name().map(norm)
-    df["month_part"] = df["date"].dt.day.map(month_part)
-    if "client_mg" in df.columns:
-        df["mg_band"] = pd.to_numeric(df["client_mg"], errors="coerce").fillna(0).map(mg_band)
 
     for col in logic.encoder_columns:
         if col not in df.columns and col in autofill_defaults:
@@ -518,6 +572,15 @@ def build_inputs(df, columns, encoders):
     )
     y = np.array(df["ideal_pp"], dtype=float)
     return X, y
+
+
+def masked_mean(emb, ids, pad):
+    """Average of the embeddings whose id is not `pad`; all zeros when there is none. Keras' masked
+    GlobalAveragePooling1D gives 0/0 = NaN there (a one-dish menu, or every other dish new), which
+    ReLU then turns into a prediction that ignores the dish, the weekday and the meal day."""
+    ops = tf.keras.ops
+    keep = ops.expand_dims(ops.cast(ops.not_equal(ids, pad), "float32"), -1)
+    return ops.sum(emb * keep, axis=1) / ops.maximum(ops.sum(keep, axis=1), 1.0)
 
 
 def split_train_test(df, test_size=TEST_SIZE):
@@ -595,17 +658,16 @@ def build_model(encoders, feature_cols, params):
     Input streams:
       item        → Embedding(vocab+1, item_emb_dim) → Flatten
                     Learns a dense vector for the target dish.
-      co_menu_ctx → Embedding(vocab+1, item_emb_dim) → GlobalAveragePooling1D
+      co_menu_ctx → Embedding(vocab+1, item_emb_dim) → average
                     Same vocabulary; averages the embeddings of all co-menu items
                     into a single "menu context" vector.
       feature cols → one Embedding per column (weekday, day_type, holiday_type, …)
                      Dim per column is set by EMB_DIMS above.
 
-    All streams are concatenated → Dense(dense_units[0]) [→ BatchNorm] → activation
-    → Dropout(dropout) → Dense(dense_units[1]) [→ BatchNorm] → activation
-    → Dense(1, output_activation).
+    All streams are concatenated → Dense(dense_units[0], activation) → Dropout(dropout)
+    → Dense(dense_units[1], activation) → Dense(1).
     Head size, dropout, item_emb_dim and learning rate come from params
-    (per client — see model_params.json / scripts/tune.py), as do
+    (per client — see model_params.json / scripts/search.py), as do
     activation, optimizer and loss.
     """
     vocab_size = len(encoders["menu_items"].classes_)
@@ -624,10 +686,10 @@ def build_model(encoders, feature_cols, params):
     ctx_emb  = tf.keras.layers.Embedding(vocab_size + 1, item_dim)(inp_ctx)
     # mask_padding: average only the real co-menu dishes. Without it, a day with
     # 4 other dishes averages 4 real embeddings with 6 copies of the pad slot.
-    ctx_mask = tf.keras.ops.not_equal(inp_ctx, vocab_size) if params["mask_padding"] else None
     embeddings = [
         tf.keras.layers.Flatten()(item_emb),
-        tf.keras.layers.GlobalAveragePooling1D()(ctx_emb, mask=ctx_mask),
+        masked_mean(ctx_emb, inp_ctx, vocab_size) if params["mask_padding"]
+        else tf.keras.layers.GlobalAveragePooling1D()(ctx_emb),
     ]
 
     for col in feature_cols:
@@ -643,16 +705,10 @@ def build_model(encoders, feature_cols, params):
     # MLP head
     units = params["dense_units"]
     x   = tf.keras.layers.Concatenate()(embeddings)
-    def hidden(x, n):
-        if not params["batch_norm"]:
-            return tf.keras.layers.Dense(n, activation=params["activation"])(x)
-        x = tf.keras.layers.BatchNormalization()(tf.keras.layers.Dense(n)(x))
-        return tf.keras.layers.Activation(params["activation"])(x)
-
-    x   = hidden(x, int(units[0]))
+    x   = tf.keras.layers.Dense(int(units[0]), activation=params["activation"])(x)
     x   = tf.keras.layers.Dropout(float(params["dropout"]))(x)
-    x   = hidden(x, int(units[1]))
-    out = tf.keras.layers.Dense(1, activation=params["output_activation"])(x)
+    x   = tf.keras.layers.Dense(int(units[1]), activation=params["activation"])(x)
+    out = tf.keras.layers.Dense(1, activation="linear")(x)
 
     model = tf.keras.Model(inputs=inputs, outputs=out)
     optimizers = {
@@ -670,6 +726,9 @@ def build_model(encoders, feature_cols, params):
     model.compile(
         optimizer=optimizers[params["optimizer"]](learning_rate=float(params["learning_rate"])),
         loss=losses[params["loss"]],
+        # reported only (training follows the loss): the real error per epoch for the learning
+        # curve, since the square root of a Huber-type loss is not an RMSE
+        metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse")],
     )
     return model
 
@@ -679,6 +738,8 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
     seed = int(params["seed"])
     np.random.seed(seed); tf.random.set_seed(seed); random.seed(seed)
     df = prepare_dataset(ck, path, logic)
+    if params["rebase"]:
+        df = rebase_to_standards(df, pd.read_csv(standards_path(ck)))
 
     # ── Build item lookup maps ────────────────────────────────────────────────
     # These dicts map item name → sub-category / category. They are saved as
@@ -690,9 +751,7 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
     joblib.dump(item_to_cat,    _ap(ck, "item_to_cat.pkl"))
     joblib.dump(build_cat_to_subs(item_to_cat, item_to_subcat), _ap(ck, "cat_to_subs.pkl"))
 
-    columns = model_columns(logic, params)
-    if "mg_band" in columns and "mg_band" not in df.columns:
-        raise ValueError(f"[{ck}] extra feature mg_band needs a client_mg column in the dataset.")
+    columns = list(logic.encoder_columns)
     encoders = fit_encoders(df, columns)
     for col, le in encoders.items():
         joblib.dump(le, _ap(ck, f"{col}_encoder.pkl"))
@@ -713,37 +772,67 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
             "Need at least 2 valid rows."
         )
 
-    model = build_model(encoders, feature_cols, params)
-
     # ── Target: raw ideal_pp, or ideal_pp minus its category's mean ───────────
     # Means come from TRAIN rows only so the test set stays unseen. The
     # offsets artifact doubles as the mode flag for predict(): present means
     # category_offset, absent means raw (a stale one is removed).
     offsets_path = _ap(ck, "cat_offsets.pkl")
-    base_train = base_test = 0.0
+    base = np.zeros(len(df))
     if params["target_mode"] == "category_offset":
         train_df = df.iloc[train_idx]
         offsets = {k: float(v) for k, v in train_df.groupby("category")["ideal_pp"].mean().items()}
         offsets["__all__"] = float(train_df["ideal_pp"].mean())
         joblib.dump(offsets, offsets_path)
         base = df["category"].map(lambda c: category_offset(offsets, c)).to_numpy(dtype=float)
-        base_train, base_test = base[train_idx], base[test_idx]
     elif os.path.exists(offsets_path):
         os.remove(offsets_path)
+    base_train, base_test = base[train_idx], base[test_idx]
 
     # ── Train, evaluate, save ─────────────────────────────────────────────────
+    # `ensemble` models on the same data, model i starting from seed + i - 1 (model 1 from
+    # the seed set above, so ensemble 1 is exactly the single model). Predictions average them.
     patience = int(params["early_stopping"])
-    callbacks = [tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience,
-                                                  restore_best_weights=True)]
-    hist = model.fit(X_train, y_train - base_train, epochs=int(params["epochs"]), callbacks=callbacks,
-                     batch_size=int(params["batch"]),
-                     validation_split=float(params["val_split"]), verbose=verbose)
-    preds = model.predict(X_test, verbose=0).flatten() + base_test
+    models, fits = [], []
+    for i in range(1, int(params["ensemble"]) + 1):
+        if i > 1:
+            np.random.seed(seed + i - 1); tf.random.set_seed(seed + i - 1); random.seed(seed + i - 1)
+        model = build_model(encoders, feature_cols, params)
+        callbacks = [tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience,
+                                                      restore_best_weights=True)]
+        fit = model.fit(X_train, y_train - base_train, epochs=int(params["epochs"]), callbacks=callbacks,
+                        batch_size=int(params["batch"]),
+                        validation_split=float(params["val_split"]), verbose=verbose)
+        fits.append(fit.history)
+        models.append(model)
+    averaged = lambda Xs: np.mean([m.predict(Xs, verbose=0).flatten() for m in models], axis=0)
+
+    # ── Calibration on the validation rows (Keras holds out the LAST val_split of the
+    # training rows, the newest days) — a stale one is removed, like the offsets ─────────
+    calib_path, calibration = _ap(ck, "calibration.pkl"), {}
+    if params["calibrate"]:
+        val_idx = train_idx[int(len(train_idx) * (1 - float(params["val_split"]))):]
+        val_pred = averaged([a[val_idx] for a in X]) + base[val_idx]
+        calibration = category_calibration(y[val_idx] - val_pred, df["category"].iloc[val_idx])
+        joblib.dump(calibration, calib_path)
+    elif os.path.exists(calib_path):
+        os.remove(calib_path)
+    preds = (averaged(X_test) + base_test
+             + df["category"].iloc[test_idx].map(calibration).fillna(0.0).to_numpy(dtype=float))
     rmse  = float(np.sqrt(mean_squared_error(y_test, preds)))
-    model.save(_ap(ck, "per_pax_tf_model.keras"))
+    for i, m in enumerate(models, 1):
+        m.save(_ap(ck, model_file(i)))
+    i = len(models) + 1
+    while os.path.exists(_ap(ck, model_file(i))):   # a smaller ensemble leaves no stale extra models
+        os.remove(_ap(ck, model_file(i)))
+        i += 1
+    model = models[0]
     # Per-epoch loss / val_loss, read by test_model.py for learning curves.
     # holdout_dates records which test-case days were kept out of training.
-    history = {k: [float(v) for v in vs] for k, vs in hist.history.items()}
+    history = {k: [float(v) for v in vs] for k, vs in fits[0].items()}   # the learning curve shows model 1
+    # What only training knows about each averaged model; their errors are measured live
+    # from the model files (test_model.evaluate_current), so they cannot go stale.
+    history["models"] = [{"seed": seed + i, "epochs_run": len(h["loss"]),
+                          "best_epoch": int(np.argmin(h["val_loss"])) + 1} for i, h in enumerate(fits)]
     history["holdout_dates"] = sorted(str(d.date()) for d in holdout_dates(ck))
     # Spread of what the model actually learned (raw ideal_pp, or the gap from
     # the category mean): test_model.fit_diagnosis compares val loss with it.
@@ -766,7 +855,7 @@ def log_training(ck, path, df, train_idx, test_idx, params, rmse, note=""):
     """
     import csv, json
     from datetime import datetime
-    sha = file_sha(path)
+    sha = data_sha(ck, path, params)
     holdout = sorted(str(d.date()) for d in holdout_dates(ck))
     log_path = _ap(ck, "training_log.csv")
 
@@ -837,15 +926,14 @@ class PredResult:
 
 def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
             day_type=None, holiday_type=None, meal_day=None, service_date=None):
-    model          = load_model(ck)
+    models         = load_models(ck)
     item_enc       = load_enc(ck, "menu_items")
     item_to_subcat = load_map(ck, "item_to_subcat")
     feature_cols   = [c for c in load_map(ck, "features") if c != "menu_items"]
-    if {"month", "month_part"} & set(feature_cols) and service_date is None:
-        return PredResult(err="This model uses the date (month features); pass service_date.")
 
-    item_token   = (item or "").strip()
-    menu_tokens  = [(i or "").strip() for i in menu]
+    item_token   = logic.canonicalize_dish(item or "")           # same spelling fixes as training
+    menu_tokens  = [logic.canonicalize_dish(i or "") for i in menu]
+    cat, subcat  = getattr(logic, "dish_category_map", {}).get(item_token, (cat, subcat))   # same category fixes
 
     # Build the set of known items (cached on the encoder object to avoid
     # re-constructing the set on every call).
@@ -894,9 +982,6 @@ def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
         "day_type":      logic.canonicalize_day_type(day_type or "regular"),
         "holiday_type":  logic.canonicalize_holiday_type(holiday_type or "not applicable"),
         "meal_day":      logic.canonicalize_meal_day(meal_day or "veg"),
-        "month":         norm(service_date.strftime("%B")) if service_date else None,
-        "month_part":    month_part(service_date.day) if service_date else None,
-        "mg_band":       mg_band(mg),
     }
 
     # Load all encoders before the loop — one cache lookup per column, not one per iteration.
@@ -907,12 +992,14 @@ def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
         feed.append(np.array([encode_safe(encoders[col], feature_values.get(col, ""))]))
 
     # ── Run inference ─────────────────────────────────────────────────────────
-    raw = float(model.predict(feed, verbose=0)[0][0])
+    # ensemble: their average. A direct call, not model.predict: same numbers, ~6x faster for one row.
+    raw = float(np.mean([np.asarray(m(feed, training=False))[0, 0] for m in models]))
     offsets = load_offsets(ck)
     if offsets is not None:      # category_offset model: add the category mean back
         raw += category_offset(offsets, feature_values["category"])
-    # Rounding to the 5 g grid is switched off so tests see the true regression output.
-    # pp = floor005(raw)         # round down to 0.005 granularity
-    pp  = raw
+    calibration = load_calibration(ck)
+    if calibration:              # calibrate: the category's typical miss on the newest days
+        raw += calibration.get(token(feature_values["category"]), 0.0)
+    pp  = round005(raw)          # 5 g grid; internal test-set metrics still use the raw output
     tq  = pp * mg                # total quantity = per-pax × meal group count
     return PredResult(pp=pp, tq=tq, fb=is_fallback, fi=fallback_item)

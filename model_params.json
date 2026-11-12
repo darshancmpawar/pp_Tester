@@ -14,10 +14,13 @@
     ],
     "dropout": 0.1,
     "mask_padding": true,
+    "calibrate": true,
+    "rebase": true,
+    "ensemble": 3,
     "target_mode": "category_offset",
     "val_split": 0.1,
     "test_size": 0.2,
-    "_chosen_at": "2026-11-06",
-    "_why": "best on all three measures, averaged over seeds 42/7/123: internal RMSE 0.0108 vs 0.0114, 15-day accuracy 87.2% vs 84.4%, within ±10% 80 vs 72 dishes (previous production: mse, dropout 0.5, item_emb 4, layers 32/16, no masking). Watch: under-predicts some Healthy Rice dishes"
+    "_chosen_at": "2026-11-12",
+    "_why": "settings from 2026-11-06 (pseudo_huber 5 g, 64/32, dropout 0.1, emb 8, masking) + calibrate (2026-11-11) + rebase to the kitchen's standard portions, monthly (2026-11-11): in the 3-seed test, within 5 g Test 1+2 123.7 vs 103.0 of 171 and sealed Test 3 57.0 vs 46.0 of 84, shortages roughly halved, kitchen cost ~18% lower; + ensemble 3 (2026-11-12): two averaged models vs 6 single ones, Test 1+2 within 5 g 128.5 vs 123.5, within ±10% 139.0 vs 135.8, kitchen cost ~6% lower; + meal day from the menu (veg / non-veg biryani / gravy / dry, ClarioLogic.meal_day_from_menu) and provisional biryani-day standard portions (2026-11-12): single models, 3 seeds, Test 1+2 within 5 g 139.0 vs 123.7, October walk-forward 102.3 vs 90.3 of 135. Co-menu category layer (with and without dish names, widths 2/4/8) tested the same day: none beat this."
   }
 }

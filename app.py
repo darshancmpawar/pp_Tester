@@ -29,7 +29,7 @@ from client_database import CLIENT_LIST, name_to_key, get_info
 from client_logic import get_logic
 from ml_core import (
     ARTIFACT_DIR, artifacts_exist, load_map, norm, fmt_cols, stale_reasons,
-    cats_match, get_nv_cats, predict,
+    cats_match, get_nv_cats, predict, test_workbook_path, day_kind, get_params, standards_path,
 )
 from planner import (
     build_row, client_plan, fixed_pp_client_plan, vendor_plan,
@@ -456,6 +456,8 @@ def _render_production_plan_tab():
         # We hold the gate ONLY across the predict loop, not the plan-render
         # below, so non-ML rendering doesn't keep slots occupied.
         results = []
+        if getattr(LOGIC, "meal_day_from_menu", False):   # the model's day type: veg or the non-veg category picked
+            meal_day = day_kind([e["category"] for e in entries])
         try:
             with predict_gate():
                 with st.spinner("Running predictions…"):
@@ -665,28 +667,32 @@ def _retrain_from_ui():
 
 
 def _fit_chart(hist):
-    """Training vs validation error per epoch (RMSE, kg/person); lowest validation epoch marked."""
+    """Training vs validation error per epoch (RMSE, g/person); the epoch early stopping kept is circled."""
     n = len(hist["val_loss"])
-    rmse = {name: [math.sqrt(v) for v in hist[k]]
-            for name, k in (("Training error", "loss"), ("Validation error", "val_loss"))}
-    val = rmse["Validation error"]
-    best = val.index(min(val)) + 1
-    data = pd.DataFrame([{"Epoch": i + 1, "RMSE": v, "Series": name}
-                         for name, vals in rmse.items() for i, v in enumerate(vals)])
+    if "val_rmse" in hist:   # recorded every epoch since 2026-11-12
+        curves = {"Training error": hist["rmse"], "Validation error": hist["val_rmse"]}
+        title = "Error (RMSE, g per person)"
+    else:                    # older models: the root of the loss, an RMSE only for the mse loss
+        curves = {"Training error": [math.sqrt(v) for v in hist["loss"]],
+                  "Validation error": [math.sqrt(v) for v in hist["val_loss"]]}
+        title = "Error (√ loss, g per person)"
+    best = hist["val_loss"].index(min(hist["val_loss"])) + 1   # early stopping keeps the lowest validation loss
+    data = pd.DataFrame([{"Epoch": i + 1, "Error": v * 1000, "Series": name}
+                         for name, vals in curves.items() for i, v in enumerate(vals)])
     # Categorical slots 1-2 (blue, orange), stepped per theme; validated for CVD separation.
     dark = st.context.theme.type == "dark"
-    color = alt.Color("Series:N", scale=alt.Scale(domain=list(rmse), range=["#3987e5", "#d95926"] if dark
+    color = alt.Color("Series:N", scale=alt.Scale(domain=list(curves), range=["#3987e5", "#d95926"] if dark
                                                   else ["#2a78d6", "#eb6834"]),
                       legend=alt.Legend(orient="top", title=None, labelFontSize=12))
     x = alt.X("Epoch:Q", scale=alt.Scale(domain=[1, max(n, 2)], nice=False),
               axis=alt.Axis(format="d", tickMinStep=1, title="Epoch"))
-    y = alt.Y("RMSE:Q", scale=alt.Scale(zero=False), axis=alt.Axis(format=".4f", title="Error (RMSE, kg/person)"))
-    tooltip = ["Series:N", "Epoch:Q", alt.Tooltip("RMSE:Q", format=".5f")]
+    y = alt.Y("Error:Q", scale=alt.Scale(zero=False), axis=alt.Axis(format=".1f", title=title))
+    tooltip = ["Series:N", "Epoch:Q", alt.Tooltip("Error:Q", format=".2f")]
     series = alt.Chart(data).encode(x=x, y=y, color=color)
     layers = [series.mark_line(strokeWidth=2),
               series.mark_point(filled=True, size=64, opacity=1).encode(tooltip=tooltip),
               series.mark_point(size=400, opacity=0).encode(tooltip=tooltip)]   # larger hit target
-    layers.append(alt.Chart(pd.DataFrame({"Epoch": [best], "RMSE": [min(val)]}))
+    layers.append(alt.Chart(pd.DataFrame({"Epoch": [best], "Error": [curves["Validation error"][best - 1] * 1000]}))
                   .mark_point(size=260, filled=False, strokeWidth=2, color="gray").encode(x=x, y=y))
     if n > best:
         # The epochs early stopping ran past the best one: none improved, which is the proof.
@@ -700,201 +706,149 @@ def _fit_chart(hist):
     return alt.layer(*layers).properties(height=300)
 
 
-def _series_colors():
-    """Categorical slot 1 (blue) for the highlighted series, a neutral gray for the rest; stepped per theme."""
-    dark = st.context.theme.type == "dark"
-    return ("#3987e5" if dark else "#2a78d6"), ("#6b7083" if dark else "#a3a7b3")
-
-
-def _bar_chart(df, value, label, title, target=None, tooltip=()):
-    """Horizontal bars, largest first, every label shown in full, optional dashed target line."""
-    blue, _gray = _series_colors()
-    bars = (alt.Chart(df).mark_bar(cornerRadiusEnd=4, color=blue)
-            .encode(y=alt.Y(f"{label}:N", sort="-x", title=None,
-                            axis=alt.Axis(labelLimit=240, labelOverlap=False, labelFontSize=12)),
-                    x=alt.X(f"{value}:Q", title=title),
-                    tooltip=[f"{label}:N", alt.Tooltip(f"{value}:Q", format=".1f"), *tooltip]))
-    layers = [bars, bars.mark_text(align="left", dx=4, fontSize=12).encode(text=alt.Text(f"{value}:Q", format=".1f"))]
-    if target is not None:
-        layers.append(alt.Chart(pd.DataFrame({"t": [target]})).mark_rule(strokeDash=[4, 4], color="gray")
-                      .encode(x="t:Q"))
-    return alt.layer(*layers).properties(height=30 * len(df) + 20)
-
-
-def _scatter_pred_actual(points):
-    """Predicted vs actual per test row, with the y = x perfect-prediction line."""
-    blue, _gray = _series_colors()
-    lo, hi = float(min(points["actual"].min(), points["pred"].min())), float(max(points["actual"].max(), points["pred"].max()))
-    axis = dict(format=".2f", tickCount=8)
-    dots = (alt.Chart(points).mark_circle(size=40, opacity=0.6, color=blue)
-            .encode(x=alt.X("actual:Q", title="Actual (kg/person)", axis=alt.Axis(**axis)),
-                    y=alt.Y("pred:Q", title="Predicted (kg/person)", axis=alt.Axis(**axis)),
-                    tooltip=["category:N", alt.Tooltip("actual:Q", format=".4f"), alt.Tooltip("pred:Q", format=".4f")]))
-    perfect = (alt.Chart(pd.DataFrame({"actual": [lo, hi], "pred": [lo, hi]}))
-               .mark_line(strokeDash=[4, 4], color="gray").encode(x="actual:Q", y="pred:Q"))
-    return (perfect + dots).properties(height=320)
-
-
-def _metric_frame(per_segment, label):
-    return (pd.DataFrame(per_segment).T.rename_axis(label).reset_index()
-            .rename(columns={"n": "Rows", "rmse": "RMSE", "mape": "Error %", "bias": "Bias"}))
-
-
 @st.cache_data(show_spinner="Checking the current model…", max_entries=20)
-def _live_evaluation(client_key, model_mtime):
-    """Test-set results of the model on disk; model_mtime in the key re-runs it after a retrain."""
+def _live_evaluation(client_key, model_mtime, cases_mtime):
+    """Every test-case dish and every measure for the model on disk; the mtimes re-run it after a retrain or new test cases."""
     return test_model.evaluate_current(client_key)
+
+
+@st.cache_data(show_spinner="Reading the training data…", max_entries=20)
+def _data_study(client_key, data_mtime, standards_mtime):
+    """The training data by year; the mtimes re-run it when the dataset or the standard portions change."""
+    return test_model.data_study(client_key)
+
+
+def _mtime(path):
+    return os.path.getmtime(path) if path and os.path.exists(path) else 0
 
 
 def _render_model_test_section():
     """
-    One complete test of this client's model, in the report's order:
-      1 learning curves · 2 test-set metrics · 3 where it is wrong ·
-      4 predicted vs actual · 5 test cases (real days, every config) · 6 verdict.
-    Sections 1-4 describe the model on disk now (evaluated live, cached until the
-    model file changes). Run Model Test also writes the report file and the
-    verdict history; Retrain model runs scripts/train.py in a separate process.
+    The model on disk, in five parts: 1 learning curve · 2 settings and the averaged models ·
+    3 data study · 4 the last test set, day by day and dish by dish · 5 every measure on every set.
+    Every error shown is measured now from the model files (cached until they or the test cases
+    change); the learning curve, saved at training, is checked against them.
     """
     st.divider()
     st.markdown('<div class="sec"><span class="sec-icon">🧪</span><span class="sec-label">Model Test</span></div>', unsafe_allow_html=True)
-
-    run_col, retrain_col, _spacer_col = st.columns([1, 1, 3])
-    with run_col:
-        run_clicked = st.button("Run Model Test", key=key("model_test_btn"), use_container_width=True)
-    with retrain_col:
-        retrain_clicked = st.button("Retrain model", key=key("retrain_btn"), use_container_width=True,
-                                    help="Retrain this client with the settings in model_params.json.")
-    if retrain_clicked:
+    if st.button("Retrain model", key=key("retrain_btn"),
+                 help="Retrain this client with the settings in model_params.json."):
         _retrain_from_ui()
-    if run_clicked:
-        try:
-            with predict_gate():
-                with st.spinner("Evaluating model on held-out test set…"):
-                    test_model.report_client(CLIENT_KEY)
-        except GateBusy as gate_busy:
-            st.warning(str(gate_busy))
-        except Exception as e:
-            st.error(f"Model test failed: {e}")
 
-    # ── 1. Learning curves ──────────────────────────────────────────────
-    st.markdown("#### 1. Learning curves")
+    # ── 1. Learning curve ───────────────────────────────────────────────
+    st.markdown("#### 1. Learning curve")
     hist = test_model.fit_history(CLIENT_KEY)
     if hist is None:
         st.info("No training history for this model yet — click **Retrain model**.")
         return
     verdict, explanation = test_model.fit_diagnosis(hist)
-    (st.success if verdict == "good fit" else st.warning)(
-        f"{'✅' if verdict == 'good fit' else '⚠️'} **{verdict.capitalize()}** — {explanation}")
+    (st.success if verdict == "good fit" else st.warning)(f"**{verdict.capitalize()}** — {explanation}")
     st.altair_chart(_fit_chart(hist), width="stretch")
-    val = [math.sqrt(v) for v in hist["val_loss"]]
-    st.caption(f"◯ marks the lowest validation error: epoch {val.index(min(val)) + 1} ({min(val):.4f} kg/person). "
-               "The best epoch is chosen on validation error, not training error.")
-
-    # ── 2. Test-set metrics ─────────────────────────────────────────────
-    st.markdown("#### 2. Test-set metrics")
-    model_time = os.path.getmtime(os.path.join(ARTIFACT_DIR, f"{CLIENT_KEY}_per_pax_tf_model.keras"))
     try:
         with predict_gate():
-            ev = _live_evaluation(CLIENT_KEY, model_time)
+            ev = _live_evaluation(CLIENT_KEY, _mtime(os.path.join(ARTIFACT_DIR, f"{CLIENT_KEY}_per_pax_tf_model.keras")),
+                                  _mtime(test_workbook_path(CLIENT_KEY)))
     except GateBusy as gate_busy:
         st.warning(str(gate_busy))
         return
-    m = ev["metrics"]
-    rmse_col, mae_col, mape_col, bias_col, base_col = st.columns(5)
-    with rmse_col:  st.metric("RMSE (kg/person)", f"{m['rmse']:.4f}")
-    with mae_col:   st.metric("MAE (kg/person)",  f"{m['mae']:.4f}")
-    with mape_col:  st.metric("MAPE",             f"{m['mape']:.1f}%")
-    with bias_col:  st.metric("Bias",             f"{m['bias']:+.4f}")
-    with base_col:  st.metric("Baseline RMSE",    f"{m['baseline_rmse']:.4f}",
-                              delta=f"{m['rmse'] - m['baseline_rmse']:+.4f} model vs baseline",
-                              delta_color="inverse")
-
-    # ── 3. Where it is wrong ────────────────────────────────────────────
-    st.markdown(f"#### 3. Where it is wrong — error % (target ±{test_model.WITHIN_PCT:.0f}%)")
-    seg_tooltip = [alt.Tooltip("RMSE:Q", format=".4f"), alt.Tooltip("Bias:Q", format="+.4f"), "Rows:Q"]
-    for segments, name in ((ev["per_category"], "Category"), (ev["per_weekday"], "Weekday")):
-        chart = _bar_chart(_metric_frame(segments, name), "Error %", name, f"Error % by {name.lower()}",
-                           target=test_model.WITHIN_PCT, tooltip=seg_tooltip)
-        st.altair_chart(chart, width="stretch", height=chart.height)
-
-    # ── 4. Predicted vs actual ──────────────────────────────────────────
-    st.markdown("#### 4. Predicted vs actual — dots on the dashed line are perfect")
-    st.altair_chart(_scatter_pred_actual(pd.DataFrame(ev["points"])), width="stretch")
-
-    # ── 5. Test cases (real days, every config) ─────────────────────────
-    st.markdown("#### 5. Test cases — real days the model never trained on")
-    tests_path = test_model.latest_tests(CLIENT_KEY)
-    if tests_path is None:
-        st.info(f"No test-case run yet: `python test_model.py --client {CLIENT_KEY} --tests`.")
+    n_models = sum(r["Model"].startswith("Model ") for r in ev["models"])
+    st.caption(f"Model 1{f' of {n_models}' if n_models > 1 else ''}. ◯ marks the epoch early stopping "
+               "kept: the one with the lowest validation loss.")
+    if "val_rmse" in hist:   # the curve's number at the kept epoch vs the same number measured now
+        kept = hist["val_loss"].index(min(hist["val_loss"]))
+        on_curve, now = hist["val_rmse"][kept] * 1000, ev["curve_check"] * 1000
+        if abs(on_curve - now) < 0.05:
+            st.caption(f"✓ In sync with the model on disk: model 1's raw validation RMSE at the kept epoch "
+                       f"(before calibration and 5 g rounding) is {on_curve:.2f} g on the curve and {now:.2f} g "
+                       "measured now.")
+        else:
+            st.warning(f"This curve does not match the model on disk: {on_curve:.2f} g on the curve, {now:.2f} g "
+                       "measured now. It comes from another training run, or the data changed. Retrain.")
     else:
-        if os.path.getmtime(tests_path) < model_time:
-            st.info(f"These results are from before the last retrain — re-run "
-                    f"`python test_model.py --client {CLIENT_KEY} --tests`.")
-        sheets = pd.read_excel(tests_path, sheet_name=None)
-        results = sheets["Results"].assign(Config=lambda d: d["Test"].str.split().str[0])
-        why = results.drop_duplicates("Config").set_index("Config")["Config used"]
-        overall = (sheets["Category accuracy"].query("Category == 'ALL'")
-                   .assign(Config=lambda d: d["Test"].str.split().str[0])
-                   .set_index("Config")["Accuracy %"])
-        configs = pd.DataFrame({"Config": overall.index, "Accuracy %": overall.values,
-                                "Why": [why[c] for c in overall.index]})
-        # Plot each config against production: accuracies sit within a few points, which
-        # bars from zero would hide.
-        blue, gray = _series_colors()
-        configs["vs production"] = configs["Accuracy %"] - overall["Config-1"]
-        configs["Label"] = [f"{c} · {a:.1f}%" for c, a in zip(configs["Config"], configs["Accuracy %"])]
-        st.altair_chart(
-            alt.Chart(configs).mark_bar(cornerRadiusEnd=4, height={"band": 0.7}).encode(
-                y=alt.Y("Label:N", sort=alt.EncodingSortField("vs production", order="descending"), title=None,
-                        axis=alt.Axis(labelLimit=240, labelOverlap=False, labelFontSize=12)),
-                x=alt.X("vs production:Q", title="Accuracy points vs production (Config-1 = 0; right = better)"),
-                color=alt.condition(alt.datum["vs production"] > 0, alt.value(blue), alt.value(gray)),
-                tooltip=["Config:N", "Why:N", alt.Tooltip("Accuracy %:Q", format=".1f"),
-                         alt.Tooltip("vs production:Q", format="+.1f")])
-            + alt.Chart(pd.DataFrame({"z": [0]})).mark_rule(color="gray").encode(x="z:Q"),
-            width="stretch")
-        st.dataframe(configs.set_index("Config")[["Why", "Accuracy %"]], width="stretch")
-        with st.expander("Every dish, every config — one tab per day"):
-            day_names = [name for name in sheets if name[:1].isdigit()]   # sheets named YYYY-MM-DD
-            for day_tab, name in zip(st.tabs(day_names), day_names):
-                with day_tab:
-                    st.dataframe(sheets[name], width="stretch", hide_index=True)
+        st.caption("Retrain to check this curve against the model on disk.")
 
-    # ── 15-day test cases (production model, live) ──────────────────────
+    # ── 2. Settings and the averaged models ─────────────────────────────
+    st.markdown("#### 2. Settings and the averaged models")
+    params = get_params(CLIENT_KEY)
+    settings = [{"Setting": k, "Value": ", ".join(map(str, v)) if isinstance(v, list) else str(v),
+                 "What it does": test_model.SETTING_NOTES.get(k, "")}
+                for k, v in params.items() if not k.startswith("_")]
+    settings.append({"Setting": "meal_day",
+                     "Value": "from the menu" if getattr(LOGIC, "meal_day_from_menu", False) else "as logged",
+                     "What it does": "veg, or the day's non-veg category (from the menu: the one picked above)"})
+    st.dataframe(pd.DataFrame(settings), hide_index=True, width="stretch")
+    models, meta = pd.DataFrame(ev["models"]), hist.get("models", [])   # meta: what only training knows
+    for pos, (col, k) in enumerate((("Seed", "seed"), ("Epochs run", "epochs_run"), ("Best epoch", "best_epoch")), 1):
+        models.insert(pos, col, [str(meta[i][k]) if i < len(meta) else "—" for i in range(len(models))])
+    st.dataframe(models, hide_index=True, width="stretch", column_config={
+        **{c: st.column_config.NumberColumn(format="%.1f") for c in ("Validation RMSE (g)", "Internal test RMSE (g)")},
+        "Internal test within 5 g (%)": st.column_config.NumberColumn(format="%.1f%%")})
+    st.caption("Errors measured now from the model files, as the app serves them (calibrated, rounded to 5 g) and "
+               "scored like the overall table below, so the average's row matches it. That is why model 1 reads "
+               "higher here than its raw value on the learning curve. Seed, epochs run and best epoch come from "
+               "training" + ("." if meta else "; retrain to see them."))
+    if params["rebase"] and os.path.exists(standards_path(CLIENT_KEY)):
+        with st.expander("Standard portions used for re-basing"):
+            st.dataframe(pd.read_csv(standards_path(CLIENT_KEY)), hide_index=True, width="stretch")
+
+    # ── 3. Data study ───────────────────────────────────────────────────
+    st.markdown("#### 3. Data study — the training data")
+    summary, portions = _data_study(CLIENT_KEY, _mtime(CLIENT_INFO.get("dataset")), _mtime(standards_path(CLIENT_KEY)))
+    st.dataframe(summary, hide_index=True, width="stretch")
+    st.dataframe(portions, hide_index=True, width="stretch",
+                 column_config={c: st.column_config.NumberColumn(format="%d") for c in portions.columns if c != "Category"})
+    st.caption("Median per person, by year. Eaten = (cooked − wastage) ÷ client MG, so a dish with zero wastage "
+               "shows eaten = cooked. The model learns eaten, re-based to today's standard when re-basing is on.")
+
+    # ── 4. The last test set, day by day and dish by dish ───────────────
     cases = pd.DataFrame(ev["cases"])
-    ok = cases[cases["pred"].notna()] if "pred" in cases else cases.iloc[0:0]
-    st.markdown(f"#### {cases['date'].nunique()}-day test cases — production model, {len(cases)} dishes")
-    st.caption(f"Overall: accuracy {ok['acc'].mean():.1f}% · {int(ok['within'].sum())} of {len(cases)} dishes "
-               f"within ±{test_model.WITHIN_PCT:.0f}% · {len(cases) - len(ok)} could not be predicted.")
-    by_day = (ok.groupby("date")["acc"].mean().rename("Accuracy %").reset_index()
-              .assign(Day=lambda d: pd.to_datetime(d["date"]).dt.strftime("%a %d %b")))
-    chart = _bar_chart(by_day, "Accuracy %", "Day", "Accuracy % by day")
-    st.altair_chart(chart, width="stretch", height=chart.height)
-    for day, rows in cases.groupby("date", sort=True):
-        day_ok = rows[rows["pred"].notna()]
-        st.markdown(f"**{pd.Timestamp(day):%a %d %b %Y}** — {len(rows)} dishes · accuracy "
-                    f"{day_ok['acc'].mean():.1f}% · {int(day_ok['within'].sum())}/{len(rows)} "
-                    f"within ±{test_model.WITHIN_PCT:.0f}%")
-        st.dataframe(pd.DataFrame({
-            "Dish": rows["dish"], "Category": rows["category"], "Predicted": rows["pred"],
-            "Actual": rows["actual"], "Difference": rows.get("signed_diff"),
-            "Difference %": rows.get("signed_pct"), "Accuracy %": rows.get("acc"),
-            f"Within ±{test_model.WITHIN_PCT:.0f}%": rows.get("within").map({True: "yes", False: "no"}),
-            "Note": [f"fallback: {f}" if f else (e or "") for f, e in zip(rows["fallback"], rows["error"])],
-        }).style.format({"Predicted": "{:.4f}", "Actual": "{:.4f}", "Difference": "{:+.4f}",
-                         "Difference %": "{:+.1f}", "Accuracy %": "{:.1f}"}, na_rep="—"),
-            width="stretch", hide_index=True)
+    if "pred" not in cases:   # no dish could be predicted
+        cases["pred"] = float("nan")
+    labels = sorted(cases["test"].dropna().unique())
+    name = labels[-1] if labels else "Test cases"
+    shown = cases[cases["test"] == name] if labels else cases
+    st.markdown(f"#### 4. {name} — day by day and dish by dish")
+    st.caption(f"{shown['date'].min():%d %b} – {shown['date'].max():%d %b %Y}: {shown['date'].nunique()} days, "
+               f"{len(shown)} dishes the model never trained on"
+               + (f"; settings were chosen on {' and '.join(labels[:-1])}" if len(labels) > 1 else "") + ".")
+    gap, mg = shown["pred"] - shown["actual"], pd.to_numeric(shown["mg"], errors="coerce")
+    by_day = (shown.assign(short=(-gap).clip(lower=0) * mg, over=gap.clip(lower=0) * mg)
+              .groupby("date").agg(**{"Day type": ("kind", "first"), "Dishes": ("dish", "size"),
+                                      "Within 5 g": ("within_5g", "mean"), "Exact": ("exact", "sum"),
+                                      "Within ±10%": ("within", "sum"), "kg short": ("short", "sum"),
+                                      "kg over": ("over", "sum")}).reset_index())
+    by_day.insert(4, "Target met", by_day["Within 5 g"] > test_model.DAY_TARGET)
+    st.dataframe(by_day, hide_index=True, width="stretch", column_config={
+        "date": st.column_config.DateColumn("Date", format="ddd D MMM"),
+        "Within 5 g": st.column_config.ProgressColumn("Within 5 g", min_value=0, max_value=1, format="percent"),
+        "Target met": st.column_config.CheckboxColumn(f"Over {test_model.DAY_TARGET:.0%}"),
+        "kg short": st.column_config.NumberColumn(format="%.1f"),
+        "kg over": st.column_config.NumberColumn(format="%.1f")})
+    dishes = pd.DataFrame({
+        "Date": shown["date"], "Dish": shown["dish"], "Category": shown["category"],
+        "Predicted (g)": shown["pred"] * 1000, "Eaten (g)": shown["actual"] * 1000, "Difference (g)": gap * 1000,
+        "Within 5 g": shown["within_5g"], "Within ±10%": shown["within"],
+        "Note": [f"stand-in: {f}" if f else (e or "") for f, e in zip(shown["fallback"], shown["error"])]})
+    if not dishes["Note"].any():
+        dishes = dishes.drop(columns="Note")
+    st.dataframe(dishes, hide_index=True, width="stretch", column_config={
+        "Date": st.column_config.DateColumn(format="ddd D MMM"),
+        "Predicted (g)": st.column_config.NumberColumn(format="%.0f"),
+        "Eaten (g)": st.column_config.NumberColumn(format="%.0f"),
+        "Difference (g)": st.column_config.NumberColumn(format="%+.0f")})
 
-    # ── 6. Verdict ──────────────────────────────────────────────────────
-    st.markdown("#### 6. Verdict — this model vs the previous Run Model Test")
-    run = test_model.latest_run(CLIENT_KEY)
-    if run is None:
-        st.info("Click **Run Model Test** to record a verdict against the previous run.")
-    else:
-        for name, passed in run.get("checks", []):
-            st.markdown(f"{'✅' if passed else '❌'} {name}")
-        st.markdown(f"**{run['verdict']}**  \nRun {run['timestamp']}"
-                    + (f", compared with run {run['previous']}" if run.get("previous") else ""))
+    # ── 5. Overall — every measure on every set ─────────────────────────
+    st.markdown("#### 5. Overall — every measure on every set")
+    st.dataframe(pd.DataFrame(ev["overall"]), hide_index=True, width="stretch", column_config={
+        **{c: st.column_config.NumberColumn(format="%.1f%%") for c in ("Within 5 g (%)", "Exact (%)", "Within ±10% (%)")},
+        **{c: st.column_config.NumberColumn(format="%.1f") for c in ("RMSE (g)", "MAE (g)", "kg short", "kg over")},
+        "Bias (g)": st.column_config.NumberColumn(format="%+.1f")})
+    st.caption(f"Predicted and eaten both on the app's 5 g grid. Within 5 g: within one serving-spoon step of what "
+               f"was eaten per person; exact: the same step. Days over {test_model.DAY_TARGET:.0%}: days where more "
+               f"than {test_model.DAY_TARGET:.0%} of the dishes were within 5 g. Shortage: predicted more than "
+               f"{test_model.WITHIN_PCT:.0f}% below eaten. kg = the gap per person × client MG. The validation rows "
+               "also set the calibration, so they flatter the model; validation and internal test are judged at "
+               "today's standard portions.")
 
 
 _render_model_test_section()

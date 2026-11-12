@@ -181,7 +181,7 @@ Head:
 
 Output:
 - predicted `ideal_pp`
-- raw model output (the 0.005 floor in `ml_core.predict` is commented out)
+- model output rounded to the nearest 0.005 kg (`ml_core.round005`)
 - `total_qty = per_pax * mg`
 
 ---
@@ -284,9 +284,10 @@ Every operational constant is documented beside its definition. Index:
 | Stripe weekday MG drops | `client_logic.py` | `day_reductions` |
 | Fixed salad portion | `client_logic.py` | `salad_per_pax` |
 | Contracted billing portions | `client_logic.py` | `fixed_pp_map` |
-| Per-client epochs, batch, learning rate, head size, dropout | `model_params.json` (written by `scripts/tune.py`) | per client key |
+| Per-client epochs, batch, learning rate, head size, dropout, calibrate, rebase | `model_params.json` (chosen with `scripts/search.py`) | per client key |
+| Kitchen standard portions (used when `rebase` is on) | `data/<client>_standard_portions.csv` | category, weekday, grams |
 | Shared embedding widths / context length | `ml_core.py` | `EMB_DIMS`, `CTX_LEN`, `DEFAULT_PARAMS` |
-| Output rounding grids (5 heads; 5 g currently off) | `planner.py`, `ml_core.py` | `round_to_nearest_5`, `floor005` |
+| Output rounding grids (5 heads; 5 g) | `planner.py`, `ml_core.py` | `round_to_nearest_5`, `round005` |
 | Concurrent prediction limit | `concurrency.py` | `MAX_CONCURRENT_PREDICTS` |
 
 Changing anything in `encoder_columns` or `EMB_DIMS` requires a retrain:

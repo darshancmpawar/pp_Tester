@@ -218,6 +218,7 @@ class TestLoadDatasetSheetSelection:
         monkeypatch.setattr(ml_core.pd, "read_excel", fake_read_excel)
 
         class _MockLogic:
+            def canonicalize_dish(self, v):         return v
             def canonicalize_category(self, v):     return v
             def canonicalize_day_type(self, v):     return v
             def canonicalize_holiday_type(self, v): return v
@@ -250,6 +251,7 @@ class TestLoadDatasetSheetSelection:
         monkeypatch.setattr(ml_core.pd, "read_excel", fake_read_excel)
 
         class _MockLogic:
+            def canonicalize_dish(self, v):         return v
             def canonicalize_category(self, v):     return v
             def canonicalize_day_type(self, v):     return v
             def canonicalize_holiday_type(self, v): return v
