@@ -76,6 +76,7 @@ SPACE = {
     "mask_padding":   [False, True],
     "calibrate":      [False, True],
     "rebase":         [False, True],
+    "ensemble":       [1, 3],
 }
 
 

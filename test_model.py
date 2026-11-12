@@ -69,6 +69,7 @@ SETTING_NOTES = {
     "calibrate":     "TRUE = add each category's typical miss on the newest (validation) days to its predictions",
     "rebase":        "TRUE = scale past rows to today's standard portions (data/<client>_standard_portions.csv)",
     "early_stopping": "always on: stop after N epochs without improvement, keep the best (epochs = maximum)",
+    "ensemble":      "how many models (different random starts) are trained and averaged; 1 = a single model",
     "item_emb_dim":  "embedding width for the dish and its co-menu",
     "val_split":     "fraction of training rows watched as validation",
     "test_size":     "fraction of dataset days held out as the internal test set",
@@ -224,13 +225,13 @@ def evaluate_test_set(ck, info, L):
         ) from e
     params = ml_core.get_params(ck)
     train_idx, test_idx = ml_core.split_train_test(df, params["test_size"])
-    model = ml_core.load_model(ck)
+    models = ml_core.load_models(ck)
     offsets, calibration = ml_core.load_offsets(ck), ml_core.load_calibration(ck)
 
     def predicted(idx):
         rows = df.iloc[idx].copy()
         rows["actual"] = y[idx]
-        rows["pred"] = model.predict([a[idx] for a in X], verbose=0).flatten()
+        rows["pred"] = np.mean([m.predict([a[idx] for a in X], verbose=0).flatten() for m in models], axis=0)
         if offsets is not None:   # category_offset model predicts the gap from the category mean
             rows["pred"] += rows["category"].map(lambda c: ml_core.category_offset(offsets, c)).to_numpy(dtype=float)
         if calibration:           # same correction predict() adds
@@ -426,7 +427,7 @@ def parse_settings(path):
                 params[key] = str(v).strip().lower() in ("true", "1", "yes")
             elif key in ("optimizer", "loss", "activation", "target_mode"):
                 params[key] = str(v).strip().lower()
-            elif key in ("epochs", "batch", "item_emb_dim", "early_stopping", "seed"):
+            elif key in ("epochs", "batch", "item_emb_dim", "early_stopping", "seed", "ensemble"):
                 params[key] = int(float(v))
             else:
                 params[key] = float(v)

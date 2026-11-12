@@ -70,6 +70,9 @@ DEFAULT_PARAMS = {
     # category (data/<client>_standard_portions.csv): × today's standard ÷ the standard
     # in force that month. Recomputed at every retrain. See rebase_to_standards.
     "rebase":        False,
+    # How many models are trained (same data, different random starts) and averaged.
+    # Averaging cancels each model's random quirks: steadier, and it cannot overfit more.
+    "ensemble":      1,
     "val_split":     VAL_SPLIT,
     "test_size":     TEST_SIZE,
 }
@@ -119,7 +122,7 @@ def validate_params(params, where):
     for k in ("mask_padding", "calibrate", "rebase"):
         if k in params and not isinstance(params[k], bool):
             raise ValueError(f"{where}: {k}={params[k]!r} — must be true or false.")
-    for k in ("epochs", "batch", "item_emb_dim"):
+    for k in ("epochs", "batch", "item_emb_dim", "ensemble"):
         if k in params and not (isinstance(params[k], int) and params[k] > 0):
             raise ValueError(f"{where}: {k}={params[k]!r} — must be a whole number above 0.")
     if "dense_units" in params and not (isinstance(params["dense_units"], list) and len(params["dense_units"]) == 2
@@ -302,12 +305,22 @@ def _load_cached(cache_key, path, loader_fn):
             _model_cache[cache_key] = (mtime, loader_fn())
     return _model_cache[cache_key][1]
 
-def load_model(ck):
-    # TensorFlow Keras model — the heavy artifact, loaded once per client.
-    path = _ap(ck, "per_pax_tf_model.keras")
+def model_file(i):
+    """Model i of an ensemble: per_pax_tf_model.keras, then per_pax_tf_model_2.keras, ..."""
+    return "per_pax_tf_model.keras" if i == 1 else f"per_pax_tf_model_{i}.keras"
+
+def load_models(ck):
+    # TensorFlow Keras models — the heavy artifacts, loaded once per client. Predictions
+    # average all of them (one for a single model, `ensemble` of them otherwise).
     # compile=False: prediction never needs the training loss, so any loss (e.g. a
     # pseudo_huber with a custom delta) loads without being registered with Keras.
-    return _load_cached(f"{ck}:mdl", path, lambda: tf.keras.models.load_model(path, compile=False))
+    models, i = [], 1
+    while i == 1 or os.path.exists(_ap(ck, model_file(i))):
+        path = _ap(ck, model_file(i))
+        models.append(_load_cached(f"{ck}:mdl{i}", path,
+                                   lambda p=path: tf.keras.models.load_model(p, compile=False)))
+        i += 1
+    return models
 
 def load_enc(ck, col):
     # LabelEncoder for a single feature column.
@@ -731,8 +744,6 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
             "Need at least 2 valid rows."
         )
 
-    model = build_model(encoders, feature_cols, params)
-
     # ── Target: raw ideal_pp, or ideal_pp minus its category's mean ───────────
     # Means come from TRAIN rows only so the test set stays unseen. The
     # offsets artifact doubles as the mode flag for predict(): present means
@@ -750,27 +761,44 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
     base_train, base_test = base[train_idx], base[test_idx]
 
     # ── Train, evaluate, save ─────────────────────────────────────────────────
+    # `ensemble` models on the same data, model i starting from seed + i - 1 (model 1 from
+    # the seed set above, so ensemble 1 is exactly the single model). Predictions average them.
     patience = int(params["early_stopping"])
-    callbacks = [tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience,
-                                                  restore_best_weights=True)]
-    hist = model.fit(X_train, y_train - base_train, epochs=int(params["epochs"]), callbacks=callbacks,
-                     batch_size=int(params["batch"]),
-                     validation_split=float(params["val_split"]), verbose=verbose)
+    models = []
+    for i in range(1, int(params["ensemble"]) + 1):
+        if i > 1:
+            np.random.seed(seed + i - 1); tf.random.set_seed(seed + i - 1); random.seed(seed + i - 1)
+        model = build_model(encoders, feature_cols, params)
+        callbacks = [tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience,
+                                                      restore_best_weights=True)]
+        fit = model.fit(X_train, y_train - base_train, epochs=int(params["epochs"]), callbacks=callbacks,
+                        batch_size=int(params["batch"]),
+                        validation_split=float(params["val_split"]), verbose=verbose)
+        if i == 1:
+            hist = fit   # the learning curve shows model 1
+        models.append(model)
+    averaged = lambda Xs: np.mean([m.predict(Xs, verbose=0).flatten() for m in models], axis=0)
 
     # ── Calibration on the validation rows (Keras holds out the LAST val_split of the
     # training rows, the newest days) — a stale one is removed, like the offsets ─────────
     calib_path, calibration = _ap(ck, "calibration.pkl"), {}
     if params["calibrate"]:
         val_idx = train_idx[int(len(train_idx) * (1 - float(params["val_split"]))):]
-        val_pred = model.predict([a[val_idx] for a in X], verbose=0).flatten() + base[val_idx]
+        val_pred = averaged([a[val_idx] for a in X]) + base[val_idx]
         calibration = category_calibration(y[val_idx] - val_pred, df["category"].iloc[val_idx])
         joblib.dump(calibration, calib_path)
     elif os.path.exists(calib_path):
         os.remove(calib_path)
-    preds = (model.predict(X_test, verbose=0).flatten() + base_test
+    preds = (averaged(X_test) + base_test
              + df["category"].iloc[test_idx].map(calibration).fillna(0.0).to_numpy(dtype=float))
     rmse  = float(np.sqrt(mean_squared_error(y_test, preds)))
-    model.save(_ap(ck, "per_pax_tf_model.keras"))
+    for i, m in enumerate(models, 1):
+        m.save(_ap(ck, model_file(i)))
+    i = len(models) + 1
+    while os.path.exists(_ap(ck, model_file(i))):   # a smaller ensemble leaves no stale extra models
+        os.remove(_ap(ck, model_file(i)))
+        i += 1
+    model = models[0]
     # Per-epoch loss / val_loss, read by test_model.py for learning curves.
     # holdout_dates records which test-case days were kept out of training.
     history = {k: [float(v) for v in vs] for k, vs in hist.history.items()}
@@ -867,7 +895,7 @@ class PredResult:
 
 def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
             day_type=None, holiday_type=None, meal_day=None, service_date=None):
-    model          = load_model(ck)
+    models         = load_models(ck)
     item_enc       = load_enc(ck, "menu_items")
     item_to_subcat = load_map(ck, "item_to_subcat")
     feature_cols   = [c for c in load_map(ck, "features") if c != "menu_items"]
@@ -933,7 +961,7 @@ def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
         feed.append(np.array([encode_safe(encoders[col], feature_values.get(col, ""))]))
 
     # ── Run inference ─────────────────────────────────────────────────────────
-    raw = float(model.predict(feed, verbose=0)[0][0])
+    raw = float(np.mean([m.predict(feed, verbose=0)[0][0] for m in models]))   # ensemble: their average
     offsets = load_offsets(ck)
     if offsets is not None:      # category_offset model: add the category mean back
         raw += category_offset(offsets, feature_values["category"])

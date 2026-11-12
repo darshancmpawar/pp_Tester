@@ -16,10 +16,11 @@
     "mask_padding": true,
     "calibrate": true,
     "rebase": true,
+    "ensemble": 3,
     "target_mode": "category_offset",
     "val_split": 0.1,
     "test_size": 0.2,
     "_chosen_at": "2026-11-11",
-    "_why": "settings from 2026-11-06 (pseudo_huber 5 g, 64/32, dropout 0.1, emb 8, masking) + calibrate (2026-11-11) + rebase to the kitchen's standard portions, monthly (2026-11-11): in the 3-seed test, within 5 g Test 1+2 123.7 vs 103.0 of 171 and sealed Test 3 57.0 vs 46.0 of 84, shortages roughly halved, kitchen cost ~18% lower"
+    "_why": "settings from 2026-11-06 (pseudo_huber 5 g, 64/32, dropout 0.1, emb 8, masking) + calibrate (2026-11-11) + rebase to the kitchen's standard portions, monthly (2026-11-11): in the 3-seed test, within 5 g Test 1+2 123.7 vs 103.0 of 171 and sealed Test 3 57.0 vs 46.0 of 84, shortages roughly halved, kitchen cost ~18% lower; + ensemble 3 (2026-11-12): two averaged models vs 6 single ones, Test 1+2 within 5 g 128.5 vs 123.5, within ±10% 139.0 vs 135.8, kitchen cost ~6% lower"
   }
 }
