@@ -41,6 +41,7 @@ def test_day_kind_is_the_non_veg_category_on_the_menu():
     assert ml_core.day_kind(["dal", "non-veg dry"]) == "non-veg dry"
     assert ml_core.day_kind(["non-veg gravy", "non-veg biryani"]) == "non-veg biryani"   # biryani first
     assert ml_core.day_kind(["dal", "veg gravy"]) == "veg"
+    assert ml_core.day_kind(["dal", "non veg curry"]) == "non veg curry"   # Tekion's spelling
 
 
 def test_kitchen_category_fixes_apply_to_predictions_too():

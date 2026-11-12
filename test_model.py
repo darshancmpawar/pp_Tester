@@ -126,11 +126,6 @@ def save_runs(ck, runs):
     with open(p, "w", encoding="utf-8") as f:
         json.dump(runs, f, indent=2)
 
-def latest_run(ck):
-    """Summary of the most recent Run Model Test (verdict, checks, metrics), or None."""
-    runs = load_runs(ck)
-    return runs[-1] if runs else None
-
 
 # ── Section 1: learning curves ────────────────────────────────────────────────
 
@@ -159,16 +154,18 @@ def fit_diagnosis(hist):
     """
     loss, val = hist["loss"], hist["val_loss"]
     n, best = len(val), int(np.argmin(val)) + 1
-    val_rmse, target_std = float(np.sqrt(min(val))), hist["target_std"]
+    # the recorded RMSE at the kept epoch; older models only have the loss (its root is an RMSE for mse)
+    val_rmse = float(hist["val_rmse"][best - 1]) if "val_rmse" in hist else float(np.sqrt(min(val)))
+    target_std = hist["target_std"]
     if hist.get("early_stopping") and n < hist["max_epochs"]:
         if val_rmse > 0.8 * target_std:
             return "underfitting", (
-                f"Early stopping kept epoch {best}, but its validation RMSE {val_rmse:.4f} is close to "
-                f"the spread of the target ({target_std:.4f}): the model barely beats a constant.")
+                f"Early stopping kept epoch {best}, but its validation RMSE {val_rmse * 1000:.1f} g is close to "
+                f"the spread of the target ({target_std * 1000:.1f} g): the model barely beats a constant.")
         return "good fit", (
             f"Early stopping ended training at epoch {n} and kept the weights from epoch {best}, "
-            f"where validation loss was lowest. Best validation RMSE {val_rmse:.4f} vs target "
-            f"spread {target_std:.4f}.")
+            f"where validation loss was lowest. Best validation RMSE {val_rmse * 1000:.1f} g vs target "
+            f"spread {target_std * 1000:.1f} g.")
     if best <= n - 3 and val[-1] > min(val) * 1.10 and loss[-1] < loss[best - 1]:
         return "overfitting", (
             f"Validation loss bottomed at epoch {best} and rose {(val[-1] / min(val) - 1) * 100:.0f}% "
@@ -176,8 +173,8 @@ def fit_diagnosis(hist):
             f"training days. Lower epochs to about {best}, or raise dropout.")
     if val_rmse > 0.8 * target_std:
         return "underfitting", (
-            f"Best validation RMSE {val_rmse:.4f} is close to the spread of the target "
-            f"({target_std:.4f}): the model barely beats a constant. Try more epochs, a higher "
+            f"Best validation RMSE {val_rmse * 1000:.1f} g is close to the spread of the target "
+            f"({target_std * 1000:.1f} g): the model barely beats a constant. Try more epochs, a higher "
             f"learning rate or wider layers.")
     if best == n and n >= 3 and val[-1] < val[-3] * 0.98:
         return "still learning", (
@@ -185,7 +182,7 @@ def fit_diagnosis(hist):
             f"point is simply the last epoch; it has not bottomed out. More epochs may help.")
     return "good fit", (
         f"Validation loss levelled off without rising; best epoch {best} of {n}. "
-        f"Best validation RMSE {val_rmse:.4f} vs target spread {target_std:.4f}.")
+        f"Best validation RMSE {val_rmse * 1000:.1f} g vs target spread {target_std * 1000:.1f} g.")
 
 
 def learning_curves(ck, out_dir):
@@ -229,13 +226,18 @@ def evaluate_test_set(ck, info, L):
     offsets, calibration = ml_core.load_offsets(ck), ml_core.load_calibration(ck)
 
     def predicted(idx):
+        """pred = the average, as predict() serves it; pred_1, pred_2, … = each model alone,
+        with the same offset and calibration; calibration kept to take it back out."""
         rows = df.iloc[idx].copy()
         rows["actual"] = y[idx]
-        rows["pred"] = np.mean([m.predict([a[idx] for a in X], verbose=0).flatten() for m in models], axis=0)
-        if offsets is not None:   # category_offset model predicts the gap from the category mean
-            rows["pred"] += rows["category"].map(lambda c: ml_core.category_offset(offsets, c)).to_numpy(dtype=float)
-        if calibration:           # same correction predict() adds
-            rows["pred"] += rows["category"].map(lambda c: calibration.get(ml_core.token(c), 0.0)).to_numpy(dtype=float)
+        offset = (rows["category"].map(lambda c: ml_core.category_offset(offsets, c)).to_numpy(dtype=float)
+                  if offsets is not None else 0.0)   # category_offset model predicts the gap from the category mean
+        rows["calibration"] = rows["category"].map(lambda c: (calibration or {}).get(ml_core.token(c), 0.0))
+        shift = offset + rows["calibration"].to_numpy()
+        raw = [m.predict([a[idx] for a in X], verbose=0).flatten() for m in models]
+        for i, p in enumerate(raw, 1):
+            rows[f"pred_{i}"] = p + shift
+        rows["pred"] = np.mean(raw, axis=0) + shift   # as predict() serves it: average, then shift
         return rows
 
     test = predicted(test_idx)
@@ -265,28 +267,89 @@ def shortage_rows(frame):
     return len(f), out.sort_values("kg_short", ascending=False)
 
 
+def efficiency(name, frame):
+    """Every measure for one set of dishes, on the app's 5 g grid (kg/person columns actual, pred;
+    client MG in mg or client_mg). A dish that could not be predicted counts as a miss."""
+    f = frame[frame["pred"].notna()]
+    a = f["actual"].astype(float).map(ml_core.round005).to_numpy()
+    d = f["pred"].astype(float).map(ml_core.round005).to_numpy() - a
+    grams = np.round(np.abs(d) * 1000, 6)   # round(): 5 g steps come out as 5.0000001
+    w5 = pd.Series(grams <= WITHIN_G, index=f.index)
+    w10 = np.round(np.abs(d) / np.where(a > 0, a, np.nan) * 100, 6) <= WITHIN_PCT
+    mg = pd.to_numeric(f["mg"] if "mg" in f else f["client_mg"], errors="coerce").fillna(0).to_numpy()
+    day_share = w5.reindex(frame.index, fill_value=False).groupby(pd.to_datetime(frame["date"])).mean()
+    _, short = shortage_rows(frame)
+    n = len(frame)
+    return {"Set": name, "Dishes": n, "Days": len(day_share),
+            "Within 5 g (%)": 100 * w5.sum() / n, "Exact (%)": 100 * (grams == 0).sum() / n,
+            "Within ±10% (%)": 100 * w10.sum() / n, "Days over 70%": int((day_share > DAY_TARGET).sum()),
+            "RMSE (g)": 1000 * float(np.sqrt(np.mean(d ** 2))), "MAE (g)": 1000 * float(np.mean(np.abs(d))),
+            "Bias (g)": 1000 * float(np.mean(d)), "Shortages": len(short),
+            "kg short": float(short["kg_short"].sum()), "kg over": float(np.sum(np.clip(d, 0, None) * mg))}
+
+
 def evaluate_current(ck):
-    """Test-set results of the client's model on disk (no files written): headline metrics,
-    error per category and per weekday, the (actual, predicted) points, the test cases, and
-    the shortages in the validation rows, the internal test set and each test-case set."""
-    _, _, test, val = evaluate_test_set(ck, CLIENT_DB[ck], get_logic(ck))
-    cases = run_cases(ck, get_logic(ck), read_frame(ensure_workbook(ck, get_logic(ck))[0], "cases"))
+    """What the app's Model Test page shows for the model on disk (no files written): every
+    test-case dish, and every measure for the validation rows, the internal test set, each
+    test set, all of them, and the category average (no model) on all of them."""
+    L = get_logic(ck)
+    _, train, test, val = evaluate_test_set(ck, CLIENT_DB[ck], L)
+    cases = run_cases(ck, L, read_frame(ensure_workbook(ck, L)[0], "cases"))
     c = pd.DataFrame(cases)
-    sets = {"Validation": val, "Internal test": test,
-            **({str(t): g for t, g in c.groupby("test")} if c["test"].notna().any() else {"Test cases": c})}
-    shortages = {}
-    for name, frame in sets.items():
-        n, rows = shortage_rows(frame)
-        shortages[name] = {"dishes": n, "rows": rows.assign(date=rows["date"].astype(str)).to_dict("records")}
-    return {
-        "metrics": {**metrics(test["actual"], test["pred"]),
-                    "baseline_rmse": metrics(test["actual"], test["baseline"])["rmse"]},
-        "per_category": {c: metrics(g["actual"], g["pred"]) for c, g in test.groupby("category")},
-        "per_weekday":  {d: metrics(g["actual"], g["pred"]) for d, g in test.groupby("weekday")},
-        "points":       test[["actual", "pred", "category"]].to_dict("records"),
-        "cases":        cases,
-        "shortages":    shortages,
+    cat_mean = train.groupby("category")["ideal_pp"].mean()
+    no_model = c.assign(pred=c["category"].map(L.canonicalize_category).map(cat_mean)
+                        .fillna(train["ideal_pp"].mean()))
+    sets = [("Validation (newest training days)", val), ("Internal test", test)]
+    sets += [(str(t), g) for t, g in c.groupby("test")] if c["test"].notna().any() else []
+    sets += [("All test cases", c), ("All test cases — category average, no model", no_model)]
+    # Each averaged model alone, scored exactly like the overall table (so the average's row equals it).
+    n = len(ml_core.load_models(ck))
+    columns = [(f"Model {i}", f"pred_{i}") for i in range(1, n + 1)] + ([(f"Average of {n} (used)", "pred")] if n > 1 else [])
+
+    def scored(name, col):
+        v, t = efficiency(name, val.assign(pred=val[col])), efficiency(name, test.assign(pred=test[col]))
+        return {"Model": name, "Validation RMSE (g)": v["RMSE (g)"], "Internal test RMSE (g)": t["RMSE (g)"],
+                "Internal test within 5 g (%)": t["Within 5 g (%)"]}
+    models = [scored(name, col) for name, col in columns]
+    # The learning curve's number, recomputed now: model 1 on the validation rows before calibration,
+    # as Keras measured it during training (kg/person). It must match the curve at the kept epoch.
+    curve_check = float(np.sqrt(np.mean((val["pred_1"] - val["calibration"] - val["actual"]) ** 2)))
+    return {"cases": cases, "overall": [efficiency(name, frame) for name, frame in sets],
+            "models": models, "curve_check": curve_check}
+
+
+def data_study(ck):
+    """(the training data by year, each category's cooked and eaten portion by year) — the raw
+    dataset, before re-basing. Eaten = (cooked − wastage) ÷ client MG."""
+    L = get_logic(ck)
+    df = ml_core.load_dataset(ck, CLIENT_DB[ck]["dataset"], L)
+    df["year"] = df["date"].dt.year
+    day = df.groupby("date").agg(year=("year", "first"), dishes=("menu_items", "size"),
+                                 mg=("client_mg", "first"), kind=("category", ml_core.day_kind))
+    days, dishes = day.groupby("year"), df.groupby("year")
+    dates = day.index.to_series().groupby(day["year"])
+    rows = {
+        "First – last day": dates.agg(lambda d: f"{d.min():%d %b} – {d.max():%d %b}"),
+        "Days logged": days.size(),
+        "Dishes logged": dishes.size(),
+        "Dishes per day": days["dishes"].mean().round(1),
+        "Different dishes": dishes["menu_items"].nunique(),
+        "Average client MG": days["mg"].mean().round(0),
+        "Dishes with zero wastage, %": (pd.to_numeric(df["wastage"], errors="coerce").eq(0)
+                                        .groupby(df["year"]).mean() * 100).round(0),
+        "Fridays": dates.agg(lambda d: int((d.dt.day_name() == "Friday").sum())),
+        **{f"{k.capitalize()} days": day["kind"].eq(k).groupby(day["year"]).sum() for k in sorted(day["kind"].unique())},
     }
+    summary = pd.DataFrame(rows).T.astype(str).rename_axis("Measure").reset_index()
+    grams = lambda col: (df.groupby(["category", "year"])[col].median() * 1000).round(0).unstack()
+    portions = pd.concat([grams("per_pax").add_prefix("Cooked "), grams("ideal_pp").add_prefix("Eaten ")], axis=1)
+    path = ml_core.standards_path(ck)
+    if os.path.exists(path):
+        std = pd.read_csv(path)
+        std = std[std["day"].isna()].assign(category=lambda s: s["category"].map(ml_core.norm))
+        portions.insert(0, "Standard today", std.set_index("category")["grams"])
+    portions.columns = [f"{c} (g)" for c in portions.columns]
+    return summary, portions.rename_axis("Category").reset_index()
 
 
 def scatter_and_residuals(ck, test, out_dir):
@@ -477,7 +540,8 @@ def run_cases(ck, L, cases, swap=None):
             service_date=c["date"],
         )
         actual = ml_core.round005(float(c["ideal_pp"]))   # same 5 g grid as the prediction
-        row = {"case": n, "test": c.get("test"), "mg": c.get("client_mg"), "date": c["date"].date(), "dish": c["menu_items"],
+        row = {"case": n, "test": c.get("test"), "mg": c.get("client_mg"), "date": c["date"].date(),
+               "kind": kinds[pd.Timestamp(c["date"])], "dish": c["menu_items"],
                "category": c["category"], "actual": actual,
                "error": res.error, "fallback": res.fallback_item if res.fallback else None,
                "within": False, "acc": 0.0,   # a dish that cannot be predicted counts as a miss
@@ -871,16 +935,6 @@ def run_settings_tests(ck):
         f.write("\n".join(md))
     print(f"   results: {xlsx}")
     return xlsx
-
-
-def latest_tests(ck):
-    """Path of the newest settings-tests workbook for ck, or None."""
-    base = os.path.join(REPORT_DIR, ck)
-    if not os.path.isdir(base):
-        return None
-    runs = sorted(d for d in os.listdir(base) if d.startswith("tests-")
-                  and os.path.exists(os.path.join(base, d, "test_results.xlsx")))
-    return os.path.join(base, runs[-1], "test_results.xlsx") if runs else None
 
 
 def main() -> int:

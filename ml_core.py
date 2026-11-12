@@ -167,8 +167,8 @@ def day_kind(categories):
     app; on a day with two, the first in NONVEG_DAY_ORDER), else "veg". The kitchen plans portions
     by it, e.g. White Rice 70 g on biryani days against 100 g otherwise."""
     cats = {token(c) for c in categories}
-    return next((k for k in NONVEG_DAY_ORDER if k in cats),
-                next((c for c in sorted(cats) if c.startswith("non-veg")), "veg"))
+    return next((k for k in NONVEG_DAY_ORDER if k in cats),   # other spellings, e.g. Tekion's "non veg curry":
+                next((c for c in sorted(cats) if c.replace(" ", "-").startswith("non-veg")), "veg"))
 
 def rebase_to_standards(df, standards):
     """
@@ -726,6 +726,9 @@ def build_model(encoders, feature_cols, params):
     model.compile(
         optimizer=optimizers[params["optimizer"]](learning_rate=float(params["learning_rate"])),
         loss=losses[params["loss"]],
+        # reported only (training follows the loss): the real error per epoch for the learning
+        # curve, since the square root of a Huber-type loss is not an RMSE
+        metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse")],
     )
     return model
 
@@ -789,7 +792,7 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
     # `ensemble` models on the same data, model i starting from seed + i - 1 (model 1 from
     # the seed set above, so ensemble 1 is exactly the single model). Predictions average them.
     patience = int(params["early_stopping"])
-    models = []
+    models, fits = [], []
     for i in range(1, int(params["ensemble"]) + 1):
         if i > 1:
             np.random.seed(seed + i - 1); tf.random.set_seed(seed + i - 1); random.seed(seed + i - 1)
@@ -799,8 +802,7 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
         fit = model.fit(X_train, y_train - base_train, epochs=int(params["epochs"]), callbacks=callbacks,
                         batch_size=int(params["batch"]),
                         validation_split=float(params["val_split"]), verbose=verbose)
-        if i == 1:
-            hist = fit   # the learning curve shows model 1
+        fits.append(fit.history)
         models.append(model)
     averaged = lambda Xs: np.mean([m.predict(Xs, verbose=0).flatten() for m in models], axis=0)
 
@@ -826,7 +828,11 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
     model = models[0]
     # Per-epoch loss / val_loss, read by test_model.py for learning curves.
     # holdout_dates records which test-case days were kept out of training.
-    history = {k: [float(v) for v in vs] for k, vs in hist.history.items()}
+    history = {k: [float(v) for v in vs] for k, vs in fits[0].items()}   # the learning curve shows model 1
+    # What only training knows about each averaged model; their errors are measured live
+    # from the model files (test_model.evaluate_current), so they cannot go stale.
+    history["models"] = [{"seed": seed + i, "epochs_run": len(h["loss"]),
+                          "best_epoch": int(np.argmin(h["val_loss"])) + 1} for i, h in enumerate(fits)]
     history["holdout_dates"] = sorted(str(d.date()) for d in holdout_dates(ck))
     # Spread of what the model actually learned (raw ideal_pp, or the gap from
     # the category mean): test_model.fit_diagnosis compares val loss with it.
@@ -986,7 +992,8 @@ def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
         feed.append(np.array([encode_safe(encoders[col], feature_values.get(col, ""))]))
 
     # ── Run inference ─────────────────────────────────────────────────────────
-    raw = float(np.mean([m.predict(feed, verbose=0)[0][0] for m in models]))   # ensemble: their average
+    # ensemble: their average. A direct call, not model.predict: same numbers, ~6x faster for one row.
+    raw = float(np.mean([np.asarray(m(feed, training=False))[0, 0] for m in models]))
     offsets = load_offsets(ck)
     if offsets is not None:      # category_offset model: add the category mean back
         raw += category_offset(offsets, feature_values["category"])
