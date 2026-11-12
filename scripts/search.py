@@ -72,17 +72,11 @@ SPACE = {
     "loss_delta":     [0.0025, 0.005, 0.01, 0.02, 0.05],
     "optimizer":      ["adam", "adamw", "rmsprop"],
     "activation":     ["relu", "leaky_relu", "elu", "gelu", "tanh"],
-    "batch_norm":     [False, True],
+    "target_mode":    ["raw", "category_offset"],
     "mask_padding":   [False, True],
-    "extra_features": [[], ["month", "month_part"], ["mg_band"], ["month", "month_part", "mg_band"]],
-    "weight_by_mg":   [False, True],
     "calibrate":      [False, True],
     "rebase":         [False, True],
 }
-# Settings that only make sense together, tried as one change.
-LINKED = {"target": [{"target_mode": "raw", "output_activation": "linear"},
-                     {"target_mode": "raw", "output_activation": "softplus"},
-                     {"target_mode": "category_offset", "output_activation": "linear"}]}
 
 
 def mg_cost(pred, actual, mg, weight, power=1):
@@ -113,10 +107,8 @@ class Search:
         self.mg = pd.to_numeric(self.cases.get("client_mg", 1), errors="coerce").fillna(1).to_numpy(dtype=float)
         self.real = pd.to_numeric(self.cases.get("wastage", 0), errors="coerce").fillna(0).to_numpy() > 0
         self.dates = pd.to_datetime(self.cases["date"]).to_numpy()
-        days = sorted(pd.to_datetime(self.cases["date"]).unique())
-        own = self.cases.assign(date=pd.to_datetime(self.cases["date"])).groupby("date")["menu_items"].apply(
-            lambda s: [str(x) for x in s])
-        self.swapped = {d: own[days[(i + len(days) // 2) % len(days)]] for i, d in enumerate(days)}
+        days = sorted(pd.Timestamp(d) for d in pd.to_datetime(self.cases["date"]).unique())
+        self.swap = {d: days[(i + len(days) // 2) % len(days)] for i, d in enumerate(days)}   # far-apart days
         std = ml_core.standards_path(ck)
         self.data_key = [ml_core.file_sha(dataset), ml_core.file_sha(std) if os.path.exists(std) else "",
                          hashlib.sha256(self.cases.to_csv(index=False).encode()).hexdigest()[:12]]
@@ -143,7 +135,7 @@ class Search:
             _, rmse = ml_core.train_model(self.ck, test_model.CLIENT_DB[self.ck]["dataset"], self.L, params=params)
             rec = {"key": key, "rmse": rmse,
                    "model": preds(test_model.run_cases(self.ck, self.L, self.cases)),
-                   "menus swapped": preds(test_model.run_cases(self.ck, self.L, self.cases, self.swapped))}
+                   "menus swapped": preds(test_model.run_cases(self.ck, self.L, self.cases, swap=self.swap))}
             offsets = ml_core.load_offsets(self.ck)
             if offsets is not None:
                 rec["category average"] = [ml_core.round005(ml_core.category_offset(
@@ -218,7 +210,6 @@ def main() -> int:
     show(head + "\n" + row("**production**", base))
     winners = {}
     candidates = [(k, {k: v}) for k, vals in SPACE.items() for v in vals if v != prod[k]]
-    candidates += [(k, o) for k, opts in LINKED.items() for o in opts if any(prod[x] != y for x, y in o.items())]
     for k, over in candidates:
         s = S.score({**prod, **over})
         won = keeps(s, base)

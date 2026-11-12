@@ -61,18 +61,14 @@ SETTING_NOTES = {
     "optimizer":     "adam | adamw | rmsprop | sgd",
     "loss":          "error the model minimises: mse | mae | huber | pseudo_huber",
     "activation":    "hidden-layer activation: relu | leaky_relu | elu | gelu | tanh",
-    "batch_norm":    "TRUE = batch normalisation after each hidden layer",
     "loss_delta":    "huber / pseudo_huber switch point in kg: smaller = more like MAE (more dishes close)",
-    "output_activation": "linear | softplus (always > 0; only with target_mode raw)",
     "dense_units":   "neurons in hidden layer 1, layer 2 (e.g. 128,64)",
     "dropout":       "fraction of layer-1 outputs dropped while training",
     "target_mode":   "raw = predict ideal_pp | category_offset = predict gap from category mean",
     "mask_padding":  "TRUE = ignore empty co-menu slots when averaging the day's menu",
-    "weight_by_mg":  "TRUE = rows count in training in proportion to client MG (big days matter more)",
     "calibrate":     "TRUE = add each category's typical miss on the newest (validation) days to its predictions",
     "rebase":        "TRUE = scale past rows to today's standard portions (data/<client>_standard_portions.csv)",
     "early_stopping": "always on: stop after N epochs without improvement, keep the best (epochs = maximum)",
-    "extra_features": "comma list of month, month_part (early/mid/late), mg_band (headcount per 50); blank = none",
     "item_emb_dim":  "embedding width for the dish and its co-menu",
     "val_split":     "fraction of training rows watched as validation",
     "test_size":     "fraction of dataset days held out as the internal test set",
@@ -347,7 +343,7 @@ def fixed_settings(ck, L):
         ("architecture", "(fixed) dish emb + mean co-menu emb + one emb per feature "
                          "→ Dense → Dropout → Dense → Dense(1)"),
         ("output_layer", "(fixed) Dense(1), linear — predicts ideal_pp in kg/person"),
-        ("features",     "(fixed) " + ", ".join(L.encoder_columns) + " (+ extra_features above)"),
+        ("features",     "(fixed) " + ", ".join(L.encoder_columns)),
         ("feature_emb_dims", "(fixed) " + ", ".join(f"{c}={ml_core.EMB_DIMS.get(c, 2)}" for c in feats)),
         ("ctx_len",      f"(fixed) {ml_core.CTX_LEN} co-menu dishes per row"),
         ("rounding",     "(fixed) test-case predictions and actuals rounded to the nearest 0.005 kg (5 g)"),
@@ -426,11 +422,9 @@ def parse_settings(path):
             v = sheet.at[key, name]
             if key == "dense_units":
                 params[key] = [int(float(u)) for u in str(v).split(",")]
-            elif key == "extra_features":
-                params[key] = [f.strip() for f in str(v).split(",") if f.strip()]
-            elif key in ("mask_padding", "batch_norm", "weight_by_mg", "calibrate", "rebase"):
+            elif key in ("mask_padding", "calibrate", "rebase"):
                 params[key] = str(v).strip().lower() in ("true", "1", "yes")
-            elif key in ("optimizer", "loss", "activation", "target_mode", "output_activation"):
+            elif key in ("optimizer", "loss", "activation", "target_mode"):
                 params[key] = str(v).strip().lower()
             elif key in ("epochs", "batch", "item_emb_dim", "early_stopping", "seed"):
                 params[key] = int(float(v))
@@ -446,31 +440,30 @@ def params_text(p):
     return (f"epochs={p['epochs']}, batch={p['batch']}, lr={p['learning_rate']}, "
             f"optimizer={p['optimizer']}, loss={p['loss']}, activation={p['activation']}, "
             f"layers={','.join(str(u) for u in p['dense_units'])}, dropout={p['dropout']}, "
-            f"item_emb={p['item_emb_dim']}, target={p['target_mode']}, mask_padding={p['mask_padding']}, batch_norm={p['batch_norm']}, output={p['output_activation']}, "
-            f"early_stopping={p['early_stopping']}, "
-            f"extra_features={','.join(p['extra_features']) or 'none'}")
+            f"item_emb={p['item_emb_dim']}, target={p['target_mode']}, mask_padding={p['mask_padding']}, "
+            f"early_stopping={p['early_stopping']}, calibrate={p['calibrate']}, rebase={p['rebase']}")
 
 
 # ── Section 5: the test-case days ──────────────────────────────────────────
 
-def run_cases(ck, L, cases, menus=None):
+def run_cases(ck, L, cases, swap=None):
     """
     Predict every dish on the cases tab with the model currently in ARTIFACT_DIR.
-    menus: optional {date: co-menu list} to use instead of each day's own menu
-    (scripts/search.py swaps menus between days to check the model reads them).
+    swap: optional {date: other date} — predict each day with the other day's menu instead
+    of its own (scripts/search.py does this to check the model reads the menu).
     """
     cases = cases.copy()
     cases["date"] = pd.to_datetime(cases["date"], errors="coerce")
-    if menus is None:
-        menus = cases.groupby("date")["menu_items"].apply(lambda s: [str(x) for x in s])
+    menus = {pd.Timestamp(d): [str(x) for x in g["menu_items"]] for d, g in cases.groupby("date")}   # whole days
 
     def has(r, c):
         return c in r and not is_blank(r[c])
 
     out = []
     for n, c in enumerate(cases.to_dict("records"), 1):
-        res = ml_core.predict(   # real headcount: the mg_band feature depends on it
-            ck, str(c["menu_items"]), menus[c["date"]], int(c["client_mg"]) if has(c, "client_mg") else 1,
+        menu_day = (swap or {}).get(pd.Timestamp(c["date"]), pd.Timestamp(c["date"]))
+        res = ml_core.predict(   # the day's real headcount, as the app passes it
+            ck, str(c["menu_items"]), menus[menu_day], int(c["client_mg"]) if has(c, "client_mg") else 1,
             c.get("sub_category"), c.get("category"), c["date"].day_name(), L,
             day_type=c["day_type"] if has(c, "day_type") else None,
             holiday_type=c["holiday_type"] if has(c, "holiday_type") else None,
