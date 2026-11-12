@@ -344,7 +344,9 @@ def fixed_settings(ck, L):
         ("architecture", "(fixed) dish emb + mean co-menu emb + one emb per feature "
                          "→ Dense → Dropout → Dense → Dense(1)"),
         ("output_layer", "(fixed) Dense(1), linear — predicts ideal_pp in kg/person"),
-        ("features",     "(fixed) " + ", ".join(L.encoder_columns)),
+        ("features",     "(fixed) " + ", ".join(L.encoder_columns)
+                         + ("; meal_day = veg / the day's non-veg category, from the menu"
+                            if getattr(L, "meal_day_from_menu", False) else "")),
         ("feature_emb_dims", "(fixed) " + ", ".join(f"{c}={ml_core.EMB_DIMS.get(c, 2)}" for c in feats)),
         ("ctx_len",      f"(fixed) {ml_core.CTX_LEN} co-menu dishes per row"),
         ("rounding",     "(fixed) test-case predictions and actuals rounded to the nearest 0.005 kg (5 g)"),
@@ -456,6 +458,8 @@ def run_cases(ck, L, cases, swap=None):
     cases = cases.copy()
     cases["date"] = pd.to_datetime(cases["date"], errors="coerce")
     menus = {pd.Timestamp(d): [str(x) for x in g["menu_items"]] for d, g in cases.groupby("date")}   # whole days
+    kinds = {pd.Timestamp(d): ml_core.day_kind([L.canonicalize_category(c) for c in g["category"]])
+             for d, g in cases.groupby("date")}   # veg / the non-veg category, when the model uses it
 
     def has(r, c):
         return c in r and not is_blank(r[c])
@@ -468,7 +472,8 @@ def run_cases(ck, L, cases, swap=None):
             c.get("sub_category"), c.get("category"), c["date"].day_name(), L,
             day_type=c["day_type"] if has(c, "day_type") else None,
             holiday_type=c["holiday_type"] if has(c, "holiday_type") else None,
-            meal_day=c["meal_day"] if has(c, "meal_day") else None,
+            meal_day=(kinds[pd.Timestamp(c["date"])] if getattr(L, "meal_day_from_menu", False)
+                      else c["meal_day"] if has(c, "meal_day") else None),
             service_date=c["date"],
         )
         actual = ml_core.round005(float(c["ideal_pp"]))   # same 5 g grid as the prediction

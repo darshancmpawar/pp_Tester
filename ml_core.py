@@ -160,21 +160,35 @@ def data_sha(ck, dataset_path, params):
     sha = file_sha(dataset_path)
     return f"{sha}+{file_sha(standards_path(ck))}" if params.get("rebase") else sha
 
+NONVEG_DAY_ORDER = ("non-veg biryani", "non-veg gravy", "non-veg dry")   # the kitchen plans around the first
+
+def day_kind(categories):
+    """What kind of menu day it is: the non-veg category on the menu (exactly the one picked in the
+    app; on a day with two, the first in NONVEG_DAY_ORDER), else "veg". The kitchen plans portions
+    by it, e.g. White Rice 70 g on biryani days against 100 g otherwise."""
+    cats = {token(c) for c in categories}
+    return next((k for k in NONVEG_DAY_ORDER if k in cats),
+                next((c for c in sorted(cats) if c.startswith("non-veg")), "veg"))
+
 def rebase_to_standards(df, standards):
     """
     Scale each row's ideal_pp to today's standard portion: × today's standard ÷ the
     standard in force that month, taken as the month's median cooked portion (per_pax)
-    for the same category (and weekday, where the table has a weekday row). A 2025 Dal
-    day at the old 50 g standard therefore counts as a 70 g day. Categories without a
-    standard keep their rows unchanged.
+    for the same category and kind of day. The table's `day` column picks the row: a kind of
+    day (day_kind, e.g. "non-veg biryani"), a weekday name, or blank (every other day). A 2025
+    Dal day at the old 50 g standard therefore counts as a 70 g day, and a biryani day is scaled
+    by the biryani-day standard. Categories without a standard keep their rows unchanged.
     """
     if "per_pax" not in df.columns:
         raise ValueError("rebase needs the per_pax (cooked per person) column in the dataset.")
     std = standards.assign(category=standards["category"].map(norm),
-                           weekday=standards["weekday"].fillna("").astype(str).map(norm))
-    grams = {(c, w): g / 1000.0 for c, w, g in zip(std["category"], std["weekday"], std["grams"])}
+                           day=standards["day"].fillna("").astype(str).map(norm))
+    grams = {(c, d): g / 1000.0 for c, d, g in zip(std["category"], std["day"], std["grams"])}
     df = df.copy()
-    wd = df["weekday"].where([(c, w) in grams for c, w in zip(df["category"], df["weekday"])], "")
+    kind = df["date"].map(df.groupby("date")["category"].apply(day_kind))
+    # the most specific row that applies: the kind of day, then the weekday, then every day
+    wd = pd.Series([k if (c, k) in grams else w if (c, w) in grams else ""
+                    for c, w, k in zip(df["category"], df["weekday"], kind)], index=df.index)
     today = pd.Series([grams.get((c, w)) for c, w in zip(df["category"], wd)], index=df.index, dtype=float)
     cooked = pd.to_numeric(df["per_pax"], errors="coerce")
     then = cooked.groupby([df["category"], wd, df["date"].dt.to_period("M")]).transform("median")
@@ -429,6 +443,8 @@ def load_dataset(ck, path, logic):
         df.loc[rows, "category"] = cat
         if "sub_category" in df.columns:
             df.loc[rows, "sub_category"] = sub
+    if getattr(logic, "meal_day_from_menu", False):   # veg or the day's non-veg category, from its own menu
+        df["meal_day"] = df["date"].map(df.groupby("date")["category"].apply(day_kind))
     return df
 
 def build_cat_to_subs(item_to_cat, item_to_subcat):
@@ -558,6 +574,15 @@ def build_inputs(df, columns, encoders):
     return X, y
 
 
+def masked_mean(emb, ids, pad):
+    """Average of the embeddings whose id is not `pad`; all zeros when there is none. Keras' masked
+    GlobalAveragePooling1D gives 0/0 = NaN there (a one-dish menu, or every other dish new), which
+    ReLU then turns into a prediction that ignores the dish, the weekday and the meal day."""
+    ops = tf.keras.ops
+    keep = ops.expand_dims(ops.cast(ops.not_equal(ids, pad), "float32"), -1)
+    return ops.sum(emb * keep, axis=1) / ops.maximum(ops.sum(keep, axis=1), 1.0)
+
+
 def split_train_test(df, test_size=TEST_SIZE):
     """
     Return (train_idx, test_idx) as integer row positions into df.
@@ -633,7 +658,7 @@ def build_model(encoders, feature_cols, params):
     Input streams:
       item        → Embedding(vocab+1, item_emb_dim) → Flatten
                     Learns a dense vector for the target dish.
-      co_menu_ctx → Embedding(vocab+1, item_emb_dim) → GlobalAveragePooling1D
+      co_menu_ctx → Embedding(vocab+1, item_emb_dim) → average
                     Same vocabulary; averages the embeddings of all co-menu items
                     into a single "menu context" vector.
       feature cols → one Embedding per column (weekday, day_type, holiday_type, …)
@@ -661,10 +686,10 @@ def build_model(encoders, feature_cols, params):
     ctx_emb  = tf.keras.layers.Embedding(vocab_size + 1, item_dim)(inp_ctx)
     # mask_padding: average only the real co-menu dishes. Without it, a day with
     # 4 other dishes averages 4 real embeddings with 6 copies of the pad slot.
-    ctx_mask = tf.keras.ops.not_equal(inp_ctx, vocab_size) if params["mask_padding"] else None
     embeddings = [
         tf.keras.layers.Flatten()(item_emb),
-        tf.keras.layers.GlobalAveragePooling1D()(ctx_emb, mask=ctx_mask),
+        masked_mean(ctx_emb, inp_ctx, vocab_size) if params["mask_padding"]
+        else tf.keras.layers.GlobalAveragePooling1D()(ctx_emb),
     ]
 
     for col in feature_cols:

@@ -29,7 +29,7 @@ from client_database import CLIENT_LIST, name_to_key, get_info
 from client_logic import get_logic
 from ml_core import (
     ARTIFACT_DIR, artifacts_exist, load_map, norm, fmt_cols, stale_reasons,
-    cats_match, get_nv_cats, predict, test_workbook_path,
+    cats_match, get_nv_cats, predict, test_workbook_path, day_kind,
 )
 from planner import (
     build_row, client_plan, fixed_pp_client_plan, vendor_plan,
@@ -456,6 +456,8 @@ def _render_production_plan_tab():
         # We hold the gate ONLY across the predict loop, not the plan-render
         # below, so non-ML rendering doesn't keep slots occupied.
         results = []
+        if getattr(LOGIC, "meal_day_from_menu", False):   # the model's day type: veg or the non-veg category picked
+            meal_day = day_kind([e["category"] for e in entries])
         try:
             with predict_gate():
                 with st.spinner("Running predictions…"):

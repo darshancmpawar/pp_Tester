@@ -1,4 +1,5 @@
 """The co-menu: every dish is given the rest of its own day's menu, and nothing from other days."""
+import numpy as np
 import pandas as pd
 
 import ml_core
@@ -19,3 +20,10 @@ def test_every_dish_is_given_its_whole_day_menu_in_training():
     ctx = [set(int(i) for i in row if i != pad) for row in X[1]]
     assert ctx[0] == {item["jeera rice"], item["chicken biryani"]}   # dal on 1 Sep sees the other two
     assert ctx[3] == {item["tomato rasam"]}                           # dal on 2 Sep sees only rasam
+
+
+def test_a_menu_with_no_other_dishes_averages_to_zero_not_nan():
+    emb = np.array([[[1.0, 2.0], [3.0, 4.0], [9.0, 9.0]], [[9.0, 9.0], [9.0, 9.0], [9.0, 9.0]]])
+    ids = np.array([[0, 1, 5], [5, 5, 5]])   # 5 = the pad slot
+    out = np.asarray(ml_core.masked_mean(emb, ids, 5))
+    assert out.tolist() == [[2.0, 3.0], [0.0, 0.0]]

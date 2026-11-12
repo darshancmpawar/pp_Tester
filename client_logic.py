@@ -166,6 +166,10 @@ class BaseLogic(ABC):
     # Dish → (category, sub-category) where some rows logged it under the wrong one.
     @property
     def dish_category_map(self): return {}
+    # True: the model's meal_day input is veg / non-veg biryani / non-veg gravy / non-veg dry, worked
+    # out from the day's menu (ml_core.day_kind) in training, test cases and the app, instead of the
+    # logged column. In the app it is exactly the non-veg category picked.
+    meal_day_from_menu = False
     @property
     def day_type_map(self): return {"regular":"regular","previous day of holiday":"previous day of holiday","next day of holiday":"next day of holiday","holiday":"holiday"}
     @property
@@ -278,6 +282,7 @@ class TekionLogic(BaseLogic):
 # Volume band: 40–240 MG, median ~130 — the smallest site.
 # ═══════════════════════════════════════════════════════════════════════
 class ClarioLogic(BaseLogic):
+    meal_day_from_menu = True   # tested 2026-11-12: 4 values beat 3 and the logged veg/nonveg
     @property
     def encoder_columns(self): return ["weekday","menu_items","sub_category","category","meal_day"]
     @property
