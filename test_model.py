@@ -160,12 +160,12 @@ def fit_diagnosis(hist):
     if hist.get("early_stopping") and n < hist["max_epochs"]:
         if val_rmse > 0.8 * target_std:
             return "underfitting", (
-                f"Early stopping kept epoch {best}, but its validation RMSE {val_rmse * 1000:.1f} g is close to "
-                f"the spread of the target ({target_std * 1000:.1f} g): the model barely beats a constant.")
+                f"Early stopping kept epoch {best}, but its validation RMSE {val_rmse:.4f} pp is close to "
+                f"the spread of the target ({target_std:.4f} pp): the model barely beats a constant.")
         return "good fit", (
             f"Early stopping ended training at epoch {n} and kept the weights from epoch {best}, "
-            f"where validation loss was lowest. Best validation RMSE {val_rmse * 1000:.1f} g vs target "
-            f"spread {target_std * 1000:.1f} g.")
+            f"where validation loss was lowest. Best validation RMSE {val_rmse:.4f} pp vs target "
+            f"spread {target_std:.4f} pp.")
     if best <= n - 3 and val[-1] > min(val) * 1.10 and loss[-1] < loss[best - 1]:
         return "overfitting", (
             f"Validation loss bottomed at epoch {best} and rose {(val[-1] / min(val) - 1) * 100:.0f}% "
@@ -173,8 +173,8 @@ def fit_diagnosis(hist):
             f"training days. Lower epochs to about {best}, or raise dropout.")
     if val_rmse > 0.8 * target_std:
         return "underfitting", (
-            f"Best validation RMSE {val_rmse * 1000:.1f} g is close to the spread of the target "
-            f"({target_std * 1000:.1f} g): the model barely beats a constant. Try more epochs, a higher "
+            f"Best validation RMSE {val_rmse:.4f} pp is close to the spread of the target "
+            f"({target_std:.4f} pp): the model barely beats a constant. Try more epochs, a higher "
             f"learning rate or wider layers.")
     if best == n and n >= 3 and val[-1] < val[-3] * 0.98:
         return "still learning", (
@@ -182,7 +182,7 @@ def fit_diagnosis(hist):
             f"point is simply the last epoch; it has not bottomed out. More epochs may help.")
     return "good fit", (
         f"Validation loss levelled off without rising; best epoch {best} of {n}. "
-        f"Best validation RMSE {val_rmse * 1000:.1f} g vs target spread {target_std * 1000:.1f} g.")
+        f"Best validation RMSE {val_rmse:.4f} pp vs target spread {target_std:.4f} pp.")
 
 
 def learning_curves(ck, out_dir):
@@ -251,41 +251,25 @@ def evaluate_test_set(ck, info, L):
     return df, train, test, val
 
 
-def shortage_rows(frame):
-    """
-    (dishes scored, the dishes predicted more than WITHIN_PCT below what was eaten), both on the
-    app's 5 g grid, worst first. kg short = (eaten − predicted) per person × client MG.
-    """
-    f = frame.rename(columns={"menu_items": "dish", "client_mg": "mg"})
-    f = f[f["pred"].notna()]
-    eaten, pred = f["actual"].map(ml_core.round005), f["pred"].astype(float).map(ml_core.round005)
-    short = ((eaten - pred) / eaten * 100).round(6) > WITHIN_PCT
-    out = f.loc[short, ["date", "dish", "category", "mg"]].assign(
-        predicted_g=pred[short] * 1000, eaten_g=eaten[short] * 1000)
-    out["short_g"] = out["eaten_g"] - out["predicted_g"]
-    out["kg_short"] = out["short_g"] / 1000 * pd.to_numeric(out["mg"], errors="coerce")
-    return len(f), out.sort_values("kg_short", ascending=False)
-
-
 def efficiency(name, frame):
-    """Every measure for one set of dishes, on the app's 5 g grid (kg/person columns actual, pred;
-    client MG in mg or client_mg). A dish that could not be predicted counts as a miss."""
+    """Every measure for one set of dishes, in pp (kg per person, columns actual and pred) on the
+    app's 5 g grid. Short / over = predicted more than WITHIN_PCT below / above expected.
+    A dish that could not be predicted counts as a miss."""
     f = frame[frame["pred"].notna()]
     a = f["actual"].astype(float).map(ml_core.round005).to_numpy()
     d = f["pred"].astype(float).map(ml_core.round005).to_numpy() - a
     grams = np.round(np.abs(d) * 1000, 6)   # round(): 5 g steps come out as 5.0000001
     w5 = pd.Series(grams <= WITHIN_G, index=f.index)
-    w10 = np.round(np.abs(d) / np.where(a > 0, a, np.nan) * 100, 6) <= WITHIN_PCT
-    mg = pd.to_numeric(f["mg"] if "mg" in f else f["client_mg"], errors="coerce").fillna(0).to_numpy()
+    pct = np.round(d / np.where(a > 0, a, np.nan) * 100, 6)   # exactly 10% off counts as within
     day_share = w5.reindex(frame.index, fill_value=False).groupby(pd.to_datetime(frame["date"])).mean()
-    _, short = shortage_rows(frame)
     n = len(frame)
     return {"Set": name, "Dishes": n, "Days": len(day_share),
             "Within 5 g (%)": 100 * w5.sum() / n, "Exact (%)": 100 * (grams == 0).sum() / n,
-            "Within ±10% (%)": 100 * w10.sum() / n, "Days over 70%": int((day_share > DAY_TARGET).sum()),
-            "RMSE (g)": 1000 * float(np.sqrt(np.mean(d ** 2))), "MAE (g)": 1000 * float(np.mean(np.abs(d))),
-            "Bias (g)": 1000 * float(np.mean(d)), "Shortages": len(short),
-            "kg short": float(short["kg_short"].sum()), "kg over": float(np.sum(np.clip(d, 0, None) * mg))}
+            "Within ±10% (%)": 100 * (np.abs(pct) <= WITHIN_PCT).sum() / n,
+            "Days over 70%": int((day_share > DAY_TARGET).sum()),
+            "RMSE (pp)": float(np.sqrt(np.mean(d ** 2))), "MAE (pp)": float(np.mean(np.abs(d))),
+            "Bias (pp)": float(np.mean(d)),
+            "Short": int((pct < -WITHIN_PCT).sum()), "Over": int((pct > WITHIN_PCT).sum())}
 
 
 def evaluate_current(ck):
@@ -308,7 +292,7 @@ def evaluate_current(ck):
 
     def scored(name, col):
         v, t = efficiency(name, val.assign(pred=val[col])), efficiency(name, test.assign(pred=test[col]))
-        return {"Model": name, "Validation RMSE (g)": v["RMSE (g)"], "Internal test RMSE (g)": t["RMSE (g)"],
+        return {"Model": name, "Validation RMSE (pp)": v["RMSE (pp)"], "Internal test RMSE (pp)": t["RMSE (pp)"],
                 "Internal test within 5 g (%)": t["Within 5 g (%)"]}
     models = [scored(name, col) for name, col in columns]
     # The learning curve's number, recomputed now: model 1 on the validation rows before calibration,
@@ -319,8 +303,8 @@ def evaluate_current(ck):
 
 
 def data_study(ck):
-    """(the training data by year, each category's cooked and eaten portion by year) — the raw
-    dataset, before re-basing. Eaten = (cooked − wastage) ÷ client MG."""
+    """(the training data by year, each category's median cooked and eaten pp by year) — the raw
+    dataset, before re-basing. Eaten (ideal pp) = (cooked − wastage) ÷ client MG."""
     L = get_logic(ck)
     df = ml_core.load_dataset(ck, CLIENT_DB[ck]["dataset"], L)
     df["year"] = df["date"].dt.year
@@ -341,14 +325,14 @@ def data_study(ck):
         **{f"{k.capitalize()} days": day["kind"].eq(k).groupby(day["year"]).sum() for k in sorted(day["kind"].unique())},
     }
     summary = pd.DataFrame(rows).T.astype(str).rename_axis("Measure").reset_index()
-    grams = lambda col: (df.groupby(["category", "year"])[col].median() * 1000).round(0).unstack()
-    portions = pd.concat([grams("per_pax").add_prefix("Cooked "), grams("ideal_pp").add_prefix("Eaten ")], axis=1)
+    median = lambda col: df.groupby(["category", "year"])[col].median().unstack()
+    portions = pd.concat([median("per_pax").add_prefix("Cooked "), median("ideal_pp").add_prefix("Eaten ")], axis=1)
     path = ml_core.standards_path(ck)
     if os.path.exists(path):
         std = pd.read_csv(path)
         std = std[std["day"].isna()].assign(category=lambda s: s["category"].map(ml_core.norm))
-        portions.insert(0, "Standard today", std.set_index("category")["grams"])
-    portions.columns = [f"{c} (g)" for c in portions.columns]
+        portions.insert(0, "Standard today", std.set_index("category")["grams"] / 1000)
+    portions.columns = [f"{c} (pp)" for c in portions.columns]
     return summary, portions.rename_axis("Category").reset_index()
 
 
