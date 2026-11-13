@@ -21,6 +21,14 @@ mean of 100 − |error %|, which reads higher; their "within ±10%" counts compa
 
 ---
 
+## 2026-11-13
+
+### Clario
+
+| Time | Change | Not changed | Result |
+|---|---|---|---|
+| — | **Kitchen-confirmed biryani-day portions** in `data/clario_standard_portions.csv`: Veg Gravy 100 → **120**, Veg Dry 110 → **120**, Flavoured Rice 160 → **150**; confirmed as they were: White Rice 70, Dal 60, Healthy Rice 120 (curd rice and the other dishes), Sambar/Rasam 100 (rasam and sambar). Bread: 60 or 66 g depending on the other dishes; the table keeps 60 (the usual), and re-basing keeps each day's difference from the month's usual, so the model learns the 66 g days from the menu. Retrained, 3 averaged models. | Model settings, everyday portions (bread 66 and Wednesday Healthy Rice 120 still provisional), dataset, test sets | Test sets, within 5 g: 202 → **197**/255 (Test 1 71 → 66, Test 2 70, Test 3 61); within ±10% 223 → 217; dishes short 17 → **13**, kg short 71.0 → **58.8**, kg over 68.4 → 88.9. **October walk-forward** (trained to 30 Sep): within 5 g 100 → **104**/135, within ±10% 113 → 117, kg short 39.5 → 27.8. September (Test 1) was cooked closer to the old estimates (e.g. veg gravy 100 g); October matches the kitchen's figures. Biryani days within 5 g: 68 → 62 of 103. Menu-swap check: 203 with swapped menus vs 197, so the dish-level co-menu adds nothing now; the meal day carries the menu effect. **In production.** |
+
 ## 2026-11-12
 
 ### Clario

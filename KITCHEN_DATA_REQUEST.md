@@ -15,20 +15,20 @@ On 13–29 Oct 2026 the app was within 5 g on 61 of 84 dishes; the kitchen's own
 
 ## 1. Confirm the biryani-day portions
 
-Please write the kitchen's biryani-day standard in the last column, or tick that ours is right. The app uses the middle column today; it is what was served on biryani days from Apr to Sep 2026.
+The kitchen answered on 13 Nov 2026, and the app now uses its figures (last column). The middle column was our estimate, from what was served on biryani days from Apr to Sep 2026.
 
-| Category | Every day (g per person) | Biryani day, used now (g per person) | Kitchen's biryani-day standard (g per person) |
+| Category | Every day (g per person) | Biryani day, our estimate (g per person) | Kitchen's biryani-day standard (g per person) |
 | --- | --- | --- | --- |
-| Sambar/Rasam | 60 | 100 |  |
-| White Rice | 100 | 70 |  |
-| Healthy Rice | 60 (Wednesday 120) | 120 |  |
-| Dal | 70 | 60 |  |
-| Veg Gravy | 120 | 100 |  |
-| Veg Dry | 100 | 110 |  |
-| Indian Bread | 66 | 60 |  |
-| Flavoured Rice | 150 | 160 |  |
+| Sambar/Rasam | 60 | 100 | 100 (rasam and sambar) |
+| White Rice | 100 | 70 | 70 |
+| Healthy Rice | 60 (Wednesday 120) | 120 | 120 (curd rice and the other dishes) |
+| Dal | 70 | 60 | 60 |
+| Veg Gravy | 120 | 100 | 120 |
+| Veg Dry | 100 | 110 | 120 |
+| Indian Bread | 66 | 60 | 60 or 66, depending on the other dishes |
+| Flavoured Rice | 150 | 160 | 150 |
 
-Sambar/Rasam is the one to check first: the kitchen says rasam is 60 g, but 100 g was served on biryani days.
+For bread, the app keeps 60 g as the usual biryani-day figure and learns the 66 g days from the other dishes on the menu.
 
 Two everyday portions also still need a decision:
 
