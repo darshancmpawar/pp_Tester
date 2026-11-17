@@ -21,6 +21,23 @@ mean of 100 − |error %|, which reads higher; their "within ±10%" counts compa
 
 ---
 
+## 2026-11-17
+
+### Clario
+
+| Time | Change | Not changed | Result |
+|---|---|---|---|
+| — | **Stronger test of how many averaged models** (the 2026-11-16 test used only 3 seed groups, too few to separate sizes). 10 fresh seed groups (seeds 1000–1094, never used in tuning); per group one 5-model training, size N = its first N models with its own calibration, scored through the real `predict()`; plus the October walk-forward. Harness checked first: seeds 42–44 rebuilt this way reproduce the live model exactly. Rule fixed before: keep 3 unless beaten by the keep rule; a smaller size wins if within 1 dish on within 5 g and ±10%, on Test 1+2 and October. | Live model (decided in the next row) | Mean of 10 groups, difference from 3 with 95% range. Test 1+2 within 5 g: **1:** 131.9, −5.6 [−9.9, −1.3]; **2:** 136.6, −0.9 [−3.1, +1.3]; **3:** 137.5; **4:** 137.2, −0.3 [−2.9, +2.3]; **5:** 137.7, +0.2 [−1.7, +2.1]. October within 5 g: 96.7 / 99.6 / 99.7 / 100.5 / 99.5. Within ±10% (Test 1+2): 147.5 / 150.7 / 150.6 / 150.3 / 152.3. kg cost (Test 1+2): 132.9 / 122.7 / 120.9 / 120.8 / 118.3. **Only 1 model is worse; 2 to 5 are tied within noise.** By the fixed rule: 2. 2 is a hair behind 3 on most measures (−0.9 within 5 g, cost +1.5%), each within noise. |
+| — | **Live model: 5 averaged models instead of 3** (`model_params.json` `ensemble` 3 → 5; settings tab Config-1 updated). Chosen by the user from the 10-group test above: within 5 g tied (Test 1+2 137.7 vs 137.5, October 99.5 vs 99.7); within ±10% higher in both periods (Test 1+2 152.3 vs 150.6, October 115.6 vs 114.2); kg cost (shortage ×1.5) about 2% lower in both (Test 1+2 118.3 vs 120.9, October 92.1 vs 94.2). Below the bar fixed before the test (+4 within 5 g, 3% lower cost): a small, steadier gain, not a breakthrough. Seeds 42–46: models 1–3 use the same seeds as before, models 4 and 5 are new; calibration recomputed on the average of 5. A day's prediction takes about 5/3 as long (about 0.5 → 0.8 s for 7 dishes). Also tested the same day and not used: one model with the 3 models' weights averaged scored 149/255 within 5 g (the models store what they learn in different hidden units, so averaging weights blurs dishes together). | Other settings, standard portions, dataset, test sets, code | Test sets within 5 g 197 → **200**/255 (Test 1 66 → 69, Test 2 70, Test 3 61); within ±10% 217 → **221**; days over 70% 20 → 21 of 30; kg short 58.8 → 61.0, kg over 88.9 → 83.8. **October walk-forward** (trained to 30 Sep): within 5 g 104 → 103/135, within ±10% 117 → 118, kg short 27.8 → 25.5. Biryani days 62/103 (unchanged). Menu-swap check: 205 vs 200, so the dish co-menu still adds nothing. Learning curve 0.00737 pp = measured. Validation RMSE of the average 0.0066 pp; internal test 0.0115 pp. **In production.** |
+
+## 2026-11-16
+
+### Clario
+
+| Time | Change | Not changed | Result |
+|---|---|---|---|
+| — | **Tested: how many averaged models.** Sizes 1 to 5, each with three separate seed groups (42.., 7.., 123..), production settings and standards; rule fixed before: keep 3 unless a size beats it by the keep rule, or a smaller size is within 1 dish. | Live model (stays 3) | Test 1+2 within 5 g (seed groups, swing) · within ±10% · kg cost · Test 3 within 5 g: **1:** 133.3 (133/137/130, 7) · 144.7 · 128.3 · 60.0; **2:** 134.0 (130/139/133, 9) · 146.0 · 128.5 · 60.7; **3:** 139.0 (136/142/139, 6) · 151.0 · 121.2 · 62.7; **4:** 140.7 (142/142/138, 4) · 152.3 · 119.3 · 63.3; **5:** 139.0 (139/140/138, 2) · 151.0 · 123.7 · 63.3. 1 → 3 is a real gain; beyond 3 more models are steadier (smaller swing) but not more accurate within 5 g. **3 stays.** |
+
 ## 2026-11-13
 
 ### Clario
