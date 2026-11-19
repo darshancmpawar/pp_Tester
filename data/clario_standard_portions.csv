@@ -1,21 +1,21 @@
 category,day,grams,note
 indian bread,,66,"provisional: kitchen standard 60 g, served 66 g since 2026 - decision pending"
-indian bread,non-veg biryani,60,provisional biryani-day portion (served Apr-Oct 2026) - kitchen to confirm
+indian bread,non-veg biryani,60,"kitchen 2026-11-13: 60 or 66 g depending on the other dishes; 60 = the usual, the model learns the rest from the menu"
 veg gravy,,120,
-veg gravy,non-veg biryani,100,provisional biryani-day portion (served Apr-Oct 2026) - kitchen to confirm
+veg gravy,non-veg biryani,120,kitchen-confirmed 2026-11-13
 veg dry,,100,
-veg dry,non-veg biryani,110,provisional biryani-day portion (served Apr-Oct 2026) - kitchen to confirm
+veg dry,non-veg biryani,120,kitchen-confirmed 2026-11-13
 flavoured rice,,150,
-flavoured rice,non-veg biryani,160,provisional biryani-day portion (served Apr-Oct 2026) - kitchen to confirm
+flavoured rice,non-veg biryani,150,kitchen-confirmed 2026-11-13
 healthy rice,,60,
 healthy rice,wednesday,120,"provisional: kitchen standard 100 g, served 120 g since Apr 2026 - decision pending"
-healthy rice,non-veg biryani,120,provisional biryani-day portion (served Apr-Oct 2026) - kitchen to confirm
+healthy rice,non-veg biryani,120,kitchen-confirmed 2026-11-13 (curd rice and the other healthy rice dishes)
 sambar/rasam,,60,
-sambar/rasam,non-veg biryani,100,provisional biryani-day portion (served Apr-Oct 2026) - kitchen to confirm
+sambar/rasam,non-veg biryani,100,kitchen-confirmed 2026-11-13 (rasam and sambar)
 dal,,70,
-dal,non-veg biryani,60,provisional biryani-day portion (served Apr-Oct 2026) - kitchen to confirm
+dal,non-veg biryani,60,kitchen-confirmed 2026-11-13
 white rice,,100,
-white rice,non-veg biryani,70,provisional biryani-day portion (served Apr-Oct 2026) - kitchen to confirm
+white rice,non-veg biryani,70,kitchen-confirmed 2026-11-13
 non-veg biryani,,350,
 non-veg gravy,,180,
 non-veg dry,,150,

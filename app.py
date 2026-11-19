@@ -540,10 +540,10 @@ def _render_production_plan_tab():
         )
         # Display-only rename; internal column names stay stable for the planner.
         client_plan_display = client_plan_df.rename(
-            columns={"Client PP": "Per Pax Qty(g)", "Total Qty": "Total Qty(kg)"}
+            columns={"Client PP": "Per Pax (pp)", "Total Qty": "Total Qty(kg)"}
         )
         st.dataframe(
-            fmt_cols(client_plan_display, ["Per Pax Qty(g)", "Total Qty(kg)"]),
+            fmt_cols(client_plan_display, ["Per Pax (pp)", "Total Qty(kg)"]),
             use_container_width=True, hide_index=True,
         )
         st.markdown("<br>", unsafe_allow_html=True)
@@ -667,17 +667,17 @@ def _retrain_from_ui():
 
 
 def _fit_chart(hist):
-    """Training vs validation error per epoch (RMSE, g/person); the epoch early stopping kept is circled."""
+    """Training vs validation error per epoch (RMSE, pp = kg per person); the epoch early stopping kept is circled."""
     n = len(hist["val_loss"])
     if "val_rmse" in hist:   # recorded every epoch since 2026-11-12
         curves = {"Training error": hist["rmse"], "Validation error": hist["val_rmse"]}
-        title = "Error (RMSE, g per person)"
+        title = "Error (RMSE, pp)"
     else:                    # older models: the root of the loss, an RMSE only for the mse loss
         curves = {"Training error": [math.sqrt(v) for v in hist["loss"]],
                   "Validation error": [math.sqrt(v) for v in hist["val_loss"]]}
-        title = "Error (√ loss, g per person)"
+        title = "Error (√ loss, pp)"
     best = hist["val_loss"].index(min(hist["val_loss"])) + 1   # early stopping keeps the lowest validation loss
-    data = pd.DataFrame([{"Epoch": i + 1, "Error": v * 1000, "Series": name}
+    data = pd.DataFrame([{"Epoch": i + 1, "Error": v, "Series": name}
                          for name, vals in curves.items() for i, v in enumerate(vals)])
     # Categorical slots 1-2 (blue, orange), stepped per theme; validated for CVD separation.
     dark = st.context.theme.type == "dark"
@@ -686,13 +686,13 @@ def _fit_chart(hist):
                       legend=alt.Legend(orient="top", title=None, labelFontSize=12))
     x = alt.X("Epoch:Q", scale=alt.Scale(domain=[1, max(n, 2)], nice=False),
               axis=alt.Axis(format="d", tickMinStep=1, title="Epoch"))
-    y = alt.Y("Error:Q", scale=alt.Scale(zero=False), axis=alt.Axis(format=".1f", title=title))
-    tooltip = ["Series:N", "Epoch:Q", alt.Tooltip("Error:Q", format=".2f")]
+    y = alt.Y("Error:Q", scale=alt.Scale(zero=False), axis=alt.Axis(format=".4f", title=title))
+    tooltip = ["Series:N", "Epoch:Q", alt.Tooltip("Error:Q", format=".5f")]
     series = alt.Chart(data).encode(x=x, y=y, color=color)
     layers = [series.mark_line(strokeWidth=2),
               series.mark_point(filled=True, size=64, opacity=1).encode(tooltip=tooltip),
               series.mark_point(size=400, opacity=0).encode(tooltip=tooltip)]   # larger hit target
-    layers.append(alt.Chart(pd.DataFrame({"Epoch": [best], "Error": [curves["Validation error"][best - 1] * 1000]}))
+    layers.append(alt.Chart(pd.DataFrame({"Epoch": [best], "Error": [curves["Validation error"][best - 1]]}))
                   .mark_point(size=260, filled=False, strokeWidth=2, color="gray").encode(x=x, y=y))
     if n > best:
         # The epochs early stopping ran past the best one: none improved, which is the proof.
@@ -756,13 +756,13 @@ def _render_model_test_section():
                "kept: the one with the lowest validation loss.")
     if "val_rmse" in hist:   # the curve's number at the kept epoch vs the same number measured now
         kept = hist["val_loss"].index(min(hist["val_loss"]))
-        on_curve, now = hist["val_rmse"][kept] * 1000, ev["curve_check"] * 1000
-        if abs(on_curve - now) < 0.05:
+        on_curve, now = hist["val_rmse"][kept], ev["curve_check"]
+        if abs(on_curve - now) < 0.00005:
             st.caption(f"✓ In sync with the model on disk: model 1's raw validation RMSE at the kept epoch "
-                       f"(before calibration and 5 g rounding) is {on_curve:.2f} g on the curve and {now:.2f} g "
+                       f"(before calibration and 5 g rounding) is {on_curve:.4f} pp on the curve and {now:.4f} pp "
                        "measured now.")
         else:
-            st.warning(f"This curve does not match the model on disk: {on_curve:.2f} g on the curve, {now:.2f} g "
+            st.warning(f"This curve does not match the model on disk: {on_curve:.4f} pp on the curve, {now:.4f} pp "
                        "measured now. It comes from another training run, or the data changed. Retrain.")
     else:
         st.caption("Retrain to check this curve against the model on disk.")
@@ -781,7 +781,7 @@ def _render_model_test_section():
     for pos, (col, k) in enumerate((("Seed", "seed"), ("Epochs run", "epochs_run"), ("Best epoch", "best_epoch")), 1):
         models.insert(pos, col, [str(meta[i][k]) if i < len(meta) else "—" for i in range(len(models))])
     st.dataframe(models, hide_index=True, width="stretch", column_config={
-        **{c: st.column_config.NumberColumn(format="%.1f") for c in ("Validation RMSE (g)", "Internal test RMSE (g)")},
+        **{c: st.column_config.NumberColumn(format="%.4f") for c in ("Validation RMSE (pp)", "Internal test RMSE (pp)")},
         "Internal test within 5 g (%)": st.column_config.NumberColumn(format="%.1f%%")})
     st.caption("Errors measured now from the model files, as the app serves them (calibrated, rounded to 5 g) and "
                "scored like the overall table below, so the average's row matches it. That is why model 1 reads "
@@ -796,9 +796,10 @@ def _render_model_test_section():
     summary, portions = _data_study(CLIENT_KEY, _mtime(CLIENT_INFO.get("dataset")), _mtime(standards_path(CLIENT_KEY)))
     st.dataframe(summary, hide_index=True, width="stretch")
     st.dataframe(portions, hide_index=True, width="stretch",
-                 column_config={c: st.column_config.NumberColumn(format="%d") for c in portions.columns if c != "Category"})
-    st.caption("Median per person, by year. Eaten = (cooked − wastage) ÷ client MG, so a dish with zero wastage "
-               "shows eaten = cooked. The model learns eaten, re-based to today's standard when re-basing is on.")
+                 column_config={c: st.column_config.NumberColumn(format="%.3f") for c in portions.columns if c != "Category"})
+    st.caption("Median pp (kg per person), by year. Eaten = ideal pp = (cooked − wastage) ÷ client MG, so a dish with "
+               "zero wastage shows eaten = cooked. The model learns ideal pp, re-based to today's standard when "
+               "re-basing is on.")
 
     # ── 4. The last test set, day by day and dish by dish ───────────────
     cases = pd.DataFrame(ev["cases"])
@@ -811,44 +812,44 @@ def _render_model_test_section():
     st.caption(f"{shown['date'].min():%d %b} – {shown['date'].max():%d %b %Y}: {shown['date'].nunique()} days, "
                f"{len(shown)} dishes the model never trained on"
                + (f"; settings were chosen on {' and '.join(labels[:-1])}" if len(labels) > 1 else "") + ".")
-    gap, mg = shown["pred"] - shown["actual"], pd.to_numeric(shown["mg"], errors="coerce")
-    by_day = (shown.assign(short=(-gap).clip(lower=0) * mg, over=gap.clip(lower=0) * mg)
+    gap = shown["pred"] - shown["actual"]
+    pct = (gap / shown["actual"] * 100).round(6)   # both on the 5 g grid; exactly 10% off counts as within
+    by_day = (shown.assign(short=pct < -test_model.WITHIN_PCT, over=pct > test_model.WITHIN_PCT)
               .groupby("date").agg(**{"Day type": ("kind", "first"), "Dishes": ("dish", "size"),
                                       "Within 5 g": ("within_5g", "mean"), "Exact": ("exact", "sum"),
-                                      "Within ±10%": ("within", "sum"), "kg short": ("short", "sum"),
-                                      "kg over": ("over", "sum")}).reset_index())
+                                      "Within ±10%": ("within", "sum"), "Short": ("short", "sum"),
+                                      "Over": ("over", "sum")}).reset_index())
     by_day.insert(4, "Target met", by_day["Within 5 g"] > test_model.DAY_TARGET)
     st.dataframe(by_day, hide_index=True, width="stretch", column_config={
         "date": st.column_config.DateColumn("Date", format="ddd D MMM"),
         "Within 5 g": st.column_config.ProgressColumn("Within 5 g", min_value=0, max_value=1, format="percent"),
-        "Target met": st.column_config.CheckboxColumn(f"Over {test_model.DAY_TARGET:.0%}"),
-        "kg short": st.column_config.NumberColumn(format="%.1f"),
-        "kg over": st.column_config.NumberColumn(format="%.1f")})
-    dishes = pd.DataFrame({
-        "Date": shown["date"], "Dish": shown["dish"], "Category": shown["category"],
-        "Predicted (g)": shown["pred"] * 1000, "Eaten (g)": shown["actual"] * 1000, "Difference (g)": gap * 1000,
-        "Within 5 g": shown["within_5g"], "Within ±10%": shown["within"],
-        "Note": [f"stand-in: {f}" if f else (e or "") for f, e in zip(shown["fallback"], shown["error"])]})
-    if not dishes["Note"].any():
-        dishes = dishes.drop(columns="Note")
-    st.dataframe(dishes, hide_index=True, width="stretch", column_config={
-        "Date": st.column_config.DateColumn(format="ddd D MMM"),
-        "Predicted (g)": st.column_config.NumberColumn(format="%.0f"),
-        "Eaten (g)": st.column_config.NumberColumn(format="%.0f"),
-        "Difference (g)": st.column_config.NumberColumn(format="%+.0f")})
+        "Target met": st.column_config.CheckboxColumn(f"Over {test_model.DAY_TARGET:.0%}")})
+    st.caption(f"Short / over: dishes predicted more than {test_model.WITHIN_PCT:.0f}% below / above expected. "
+               "Each day's dishes below: predicted, expected and difference in pp (kg per person), on the 5 g grid.")
+    for day, rows in shown.groupby("date"):
+        st.markdown(f"**{pd.Timestamp(day):%a %d %b}** · {rows['kind'].iloc[0]} · "
+                    f"{int(rows['within_5g'].sum())} of {len(rows)} within 5 g")
+        st.dataframe(pd.DataFrame({
+            "Dish": rows["dish"], "Category": rows["category"], "Client MG": rows["mg"],
+            "Predicted": rows["pred"], "Expected": rows["actual"], "Difference": gap[rows.index],
+            "Within 5 g": rows["within_5g"], "Within ±10%": rows["within"]}),
+            hide_index=True, width="stretch", height="content", column_config={
+                "Client MG": st.column_config.NumberColumn(format="%d"),
+                "Predicted": st.column_config.NumberColumn(format="%.3f"),
+                "Expected": st.column_config.NumberColumn(format="%.3f"),
+                "Difference": st.column_config.NumberColumn(format="%+.3f")})
 
     # ── 5. Overall — every measure on every set ─────────────────────────
     st.markdown("#### 5. Overall — every measure on every set")
     st.dataframe(pd.DataFrame(ev["overall"]), hide_index=True, width="stretch", column_config={
         **{c: st.column_config.NumberColumn(format="%.1f%%") for c in ("Within 5 g (%)", "Exact (%)", "Within ±10% (%)")},
-        **{c: st.column_config.NumberColumn(format="%.1f") for c in ("RMSE (g)", "MAE (g)", "kg short", "kg over")},
-        "Bias (g)": st.column_config.NumberColumn(format="%+.1f")})
-    st.caption(f"Predicted and eaten both on the app's 5 g grid. Within 5 g: within one serving-spoon step of what "
-               f"was eaten per person; exact: the same step. Days over {test_model.DAY_TARGET:.0%}: days where more "
-               f"than {test_model.DAY_TARGET:.0%} of the dishes were within 5 g. Shortage: predicted more than "
-               f"{test_model.WITHIN_PCT:.0f}% below eaten. kg = the gap per person × client MG. The validation rows "
-               "also set the calibration, so they flatter the model; validation and internal test are judged at "
-               "today's standard portions.")
+        **{c: st.column_config.NumberColumn(format="%.4f") for c in ("RMSE (pp)", "MAE (pp)")},
+        "Bias (pp)": st.column_config.NumberColumn(format="%+.4f")})
+    st.caption(f"Predicted and expected pp both on the app's 5 g grid. Within 5 g: within one serving-spoon step "
+               f"(0.005 pp) of expected; exact: the same step. Days over {test_model.DAY_TARGET:.0%}: days where more "
+               f"than {test_model.DAY_TARGET:.0%} of the dishes were within 5 g. Short / over: predicted more than "
+               f"{test_model.WITHIN_PCT:.0f}% below / above expected. The validation rows also set the calibration, "
+               "so they flatter the model; validation and internal test are judged at today's standard portions.")
 
 
 _render_model_test_section()
