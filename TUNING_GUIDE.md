@@ -328,7 +328,9 @@ Don't start with the knobs: they gave Clario nothing. Work top-down:
   comparable. **KEPT**.
 
 **F9. Validation and internal-test sizes** (`val_split` 0.1, `test_size` 0.2)
-- Effort: Low · Clario (19 Nov, 5 models, 3 seeds): none passed the rule. **KEPT at 0.1 / 0.2**.
+- Effort: Low · Clario (19 Nov, 5 models, 3 seeds): none passed the rule. The user chose the
+  closest anyway: **production since 19 Nov: `val_split` 0.1, `test_size` 0.05** (live: 203/255
+  within 5 g, was 200). The internal test is now 18 days, so its error is noisier.
 
   | Candidate | Within 5 g, Test 1+2 | Within ±10% | Kitchen cost | October within 5 g | Test 3 within 5 g |
   |---|---|---|---|---|---|
@@ -505,18 +507,19 @@ A model can win on every test and still lose in the kitchen. Only the shadow tri
 | History | [CHANGELOG.md](CHANGELOG.md), `artifacts/<client>_training_log.csv` |
 | What to ask the kitchen | [KITCHEN_DATA_REQUEST.md](KITCHEN_DATA_REQUEST.md) |
 
-## Clario in production (17 Nov 2026)
+## Clario in production (19 Nov 2026)
 
 **Settings:** category-offset target · pseudo-Huber, delta 0.005 · layers 64/32 · dropout 0.1 ·
 dish embedding 8 · masking · calibration · re-basing · 5 averaged models · Adam, learning rate
-0.003 · batch 32 · early stopping 5 · kind of day from the menu.
+0.003 · batch 32 · early stopping 5 · kind of day from the menu · validation = newest 10% of
+training rows · internal test = 5% of days.
 
 **Results:**
 
 | Set | Within 5 g | Within ±10% |
 |---|---|---|
-| Test sets | 200/255 | 221/255 |
-| October walk-forward | 103/135 | 118/135 |
+| Test sets | 203/255 | 227/255 |
+| October walk-forward | 104/135 | 115/135 |
 | No-model baseline | 131/255 | — |
 
 For a new client these settings are one candidate to test, not the default: start from
