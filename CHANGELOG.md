@@ -21,6 +21,14 @@ mean of 100 − |error %|, which reads higher; their "within ±10%" counts compa
 
 ---
 
+## 2026-11-19
+
+### Clario
+
+| Time | Change | Not changed | Result |
+|---|---|---|---|
+| — | **Tested: validation and internal-test sizes.** Production holds out 20% of the dataset's days at random as the internal test (`test_size` 0.2, used only for the internal error) and the newest 10% of training rows as validation (`val_split` 0.1, early stopping and calibration); the model trains on 2,146 of 2,989 rows. One change each: `test_size` 0.1 / 0.05, `val_split` 0.05 / 0.15 / 0.2; 5 averaged models, seeds 42 / 7 / 123, through the real `predict()`. Test 1+2 choose, the October walk-forward (trained to 30 Sep) confirms, Test 3 shown. Rule fixed before: the search keep rule without its RMSE test (the internal test days change with `test_size`), plus October within 5 g and ±10% not lower. | Live model, settings | Test 1+2 within 5 g / ±10% / kg cost (MG) · October within 5 g / ±10% / kg cost · Test 3 within 5 g: **production** 139.0 / 151.0 / 123.7 · 99.7 / 117.3 / 88.3 · 63.3; **test_size 0.1** 140.0 / 152.7 / 118.6 · 101.0 / 117.7 / 87.6 · 61.7; **test_size 0.05** (2,553 rows trained) 141.0 / 155.3 / 116.7 · 104.0 / 117.7 / 86.1 · 61.3; **val_split 0.05** 141.3 / 154.7 / 122.6 · 101.0 / 116.0 / 88.8 · 61.3; **val_split 0.15** 137.0 / 150.0 / 127.7 · 100.0 / 115.0 / 88.1 · 59.0; **val_split 0.2** 134.0 / 147.3 / 131.3 · 98.0 / 111.7 / 94.2 · 59.3. **None passes; production stays.** Closest: `test_size` 0.05 passes every check but within 5 g (+2.0, needs +4): cost −5.6%, October +4.3 within 5 g; Test 3 −2.0. Holding back more of the newest days (`val_split` 0.15, 0.2) is worse on everything. |
+
 ## 2026-11-17
 
 ### Clario

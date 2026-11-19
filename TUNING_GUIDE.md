@@ -327,6 +327,21 @@ Don't start with the knobs: they gave Clario nothing. Work top-down:
 - The same seed gives the same model. The train/test split always uses 42, so runs stay
   comparable. **KEPT**.
 
+**F9. Validation and internal-test sizes** (`val_split` 0.1, `test_size` 0.2)
+- Effort: Low · Clario (19 Nov, 5 models, 3 seeds): none passed the rule. **KEPT at 0.1 / 0.2**.
+
+  | Candidate | Within 5 g, Test 1+2 | Within ±10% | Kitchen cost | October within 5 g | Test 3 within 5 g |
+  |---|---|---|---|---|---|
+  | `test_size` 0.05 (closest; 19% more rows trained on) | +2.0 (needs +4) | +4.3 | −5.6% | +4.3 | −2.0 |
+  | `val_split` 0.05 | +2.3 | — | only −0.9% | October ±10% −1.3 | — |
+  | `val_split` 0.15, 0.2 | worse on everything | | | | |
+
+  Holding back more of the newest days hurts.
+- What: neither part is trained on.
+  - The **internal test** (a random 20% of days) only gives the internal error.
+  - The **validation** set (the newest 10% of training rows) drives early stopping and
+    calibration.
+
 ### G. After training: averaging, calibration, rounding
 
 **G1. Averaged models** (`ensemble`)
