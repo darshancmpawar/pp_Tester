@@ -36,6 +36,11 @@ What to change, what it costs, what it gave, and when to use it. This is the
 - **Compute the no-model baseline per client:** each category's average.
 - **Remove what fails, keep the record.** Rejected options are deleted from the code. Their
   configs stay on the workbook's settings tab, and their results stay in the CHANGELOG.
+- **When the data's meaning changes, re-test the structure.** On Clario's cleaned data (20 Nov),
+  three verdicts flipped:
+  - **Calibration** helped before; now it hurts.
+  - **The co-menu** helped before; now it hurts.
+  - **The headcount input** failed before; now it helps.
 
 ## Part 1: The workflow (in this order)
 
@@ -67,6 +72,8 @@ Don't start with the knobs: they gave Clario nothing. Work top-down:
 | A1–A2 Units in kg, consistent targets | Error 0.253 → 0.0125 kg; the model beat the baseline for the first time |
 | G3 Calibration | +8.4 within ±10% (Test 1+2, 3 seeds) |
 | G1 Averaged models, 1 → 3 | +5.6 within 5 g (10 seed groups) |
+| D7 Co-menu off (cleaned data) | +21 within 5 g (Test 1+2, 5 models) |
+| B5 Headcount band (cleaned data) | +12 within 5 g; October +6 |
 
 | The PDF expected a lot, Clario measured | Result |
 |---|---|
@@ -134,6 +141,16 @@ Don't start with the knobs: they gave Clario nothing. Work top-down:
 - Effort: Low · Clario: within 107.7 vs 109.0; cost and real demand slightly worse.
   **REJECTED**.
 
+**A11. Cooked quantity on the scale the kitchen cooks for** `[HIGHEST IMPACT]`
+- Effort: Low (a formula in the file) · Clario, 20 Nov:
+  - **The rule:** the kitchen cooks for the vendor MG, so `qty = per_pax × vendor MG`,
+    `ideal qty = qty − wastage`, `ideal pp = ideal qty ÷ client MG`.
+  - The old file used per_pax × client MG. That overstated eaten food by about 14% wherever the
+    vendor MG was lower (45% of rows from Nov 2025).
+  - The test days must follow the same rule. On the corrected days the old model fell to 54/171
+    within 5 g.
+  - **KEPT**: the cleaned file and the test days follow the rule.
+
 ### B. Kitchen knowledge and features `[HIGHEST IMPACT]`
 
 **B1. Standard portions + re-basing** (`rebase: true`, `data/<client>_standard_portions.csv`) `[HIGHEST IMPACT]`
@@ -167,9 +184,13 @@ Don't start with the knobs: they gave Clario nothing. Work top-down:
 **B4. Calibration**: see G3.
 
 **B5. Headcount feature** (`mg_band`) `[the PDF: HIGHEST IMPACT]`
-- Effort: Med (code removed) · Clario: first tested with every test dish's MG wrongly set to 1.
-  After the fix: 80.3 / 76.7 vs 83.0 / 79.7 (within ±10% of 129, normal / past-only).
-  **REJECTED**, removed 11 Nov.
+- Effort: Low (`mg_band` setting: client MG in bands ≤60 / 61–80 / 81–120 / 121–160 / >160)
+- **Old data:** first tested with every test dish's MG wrongly set to 1. After the fix: 80.3 /
+  76.7 vs 83.0 / 79.7 (within ±10% of 129, normal / past-only). **REJECTED** on 11 Nov.
+- **Cleaned data (20 Nov):** the vendor ÷ client MG ratio falls from 0.93 (≤60) to 0.84 (>160),
+  so the per-client-person portion depends on the MG.
+  - Alone: 105.0 vs 93.0 within 5 g on Test 1+2; October 80.7 vs 74.7.
+  - **KEPT** (`mg_band: true`).
 
 **B6. Season and day of month** (`month`, `month_part`) `[the PDF: HIGHEST IMPACT]`
 - Effort: Med (code removed) · Clario: better on validation (0.01515 vs 0.01553), worse on the
@@ -236,6 +257,17 @@ Don't start with the knobs: they gave Clario nothing. Work top-down:
 - Effort: Low · Clario: no gain; only works with the raw target. **REJECTED**, removed.
   The output stays linear: never ReLU on the output.
 
+**C6. Per vendor person instead of per client person** (eaten ÷ vendor MG; the app multiplies by vendor MG)
+- Effort: Med (app change) · Clario (cleaned data, 20 Nov):
+
+  | Vendor MG used | Within 5 g, Test 1+2 | Kitchen cost |
+  |---|---|---|
+  | Each day's **logged** vendor MG | 139.7 vs 93.0 | — |
+  | The **app's own** vendor MG (the planner scales the client MG from the predictions) | 96.3 | 356.6 vs 229.5 |
+
+  **REJECTED**: the gain came from knowing the kitchen's exact vendor MG, which the app doesn't
+  have before predicting.
+
 ### D. Co-menu and padding
 
 **D1. Ignore empty co-menu slots** (`mask_padding: true`) `[DO FIRST]`
@@ -259,7 +291,13 @@ Don't start with the knobs: they gave Clario nothing. Work top-down:
 **D5. Share the dish and co-menu embeddings**
 - Effort: Low · Clario: 81.3 / 75.3 vs 83.0 / 79.7. **REJECTED**.
 
-**D6. Does the model read the menu?**: see I10. Clario today: no (swapped 205 vs real 200).
+**D6. Does the model read the menu?**: see I10. Clario: old data, no (swapped 205 vs real 200).
+Cleaned data: it hurts (swapped 141 vs real 129).
+
+**D7. Switch the co-menu off** (`co_menu: false`: the other dishes of the day are ignored) `[HIGHEST IMPACT]`
+- Effort: Low · Clario (cleaned data, 20 Nov, 5 models): Test 1+2 within 5 g **114.0 vs 93.0**,
+  within ±10% 121.7 vs 105.0, kg cost −25%, October 80.0 vs 74.7. **KEPT**: simpler and better.
+- With the co-menu off, D1 (masking) has no effect: identical predictions on all 255 test dishes.
 
 ### E. Network size and regularisation
 
@@ -367,8 +405,10 @@ Don't start with the knobs: they gave Clario nothing. Work top-down:
   what it learns in different hidden units, so averaging weights blurs dishes together.
 
 **G3. Calibration** (`calibrate: true`) (the PDF: "bias correction / tilt") `[HIGHEST IMPACT]`
-- Effort: Low · Clario: Test 1+2 within ±10% 117.7 vs 109.3; sealed Test 3 53.0 vs 50.7. Off
-  costs 7 dishes within 5 g. **KEPT**.
+- Effort: Low · **Old data:** Test 1+2 within ±10% 117.7 vs 109.3; sealed Test 3 53.0 vs 50.7.
+  Off cost 7 dishes within 5 g. **KEPT** until 20 Nov.
+- **Cleaned data:** calibration off is better: 102.3 vs 93.0 within 5 g on Test 1+2 (5 models);
+  October 77.0 vs 74.7. **Off since 20 Nov**: the newest days' miss now overshoots.
 - What: each category's median miss on the validation rows (the newest 10% of training days),
   shrunk by n/(n+10), is added to its predictions. It follows the current kitchen instead of a
   blend of old and new.
@@ -436,7 +476,8 @@ Don't start with the knobs: they gave Clario nothing. Work top-down:
 
 **I10. Menu-swap check**
 - Predict each day with another day's menu. If the score doesn't drop, the model isn't using the
-  other dishes. Clario: 205 swapped vs 200 real.
+  other dishes. Clario, old data: 205 swapped vs 200 real. Cleaned data: 141 vs 129, which led to
+  D7.
 
 **I11. Seeds**
 - 3 seeds (42, 7, 123) for every comparison. For a close call, 10 fresh seed groups compared in
@@ -507,27 +548,35 @@ A model can win on every test and still lose in the kitchen. Only the shadow tri
 | History | [CHANGELOG.md](CHANGELOG.md), `artifacts/<client>_training_log.csv` |
 | What to ask the kitchen | [KITCHEN_DATA_REQUEST.md](KITCHEN_DATA_REQUEST.md) |
 
-## Clario in production (19 Nov 2026)
+## Clario in production (20 Nov 2026)
+
+**Data:** the cleaned file: qty = per_pax × vendor MG, ideal pp = (qty − wastage) ÷ client MG.
+The test days are corrected the same way.
 
 **Settings:** category-offset target · pseudo-Huber, delta 0.005 · layers 64/32 · dropout 0.1 ·
-dish embedding 8 · masking · calibration · re-basing · 5 averaged models · Adam, learning rate
-0.003 · batch 32 · early stopping 5 · kind of day from the menu · validation = newest 10% of
-training rows · internal test = 5% of days.
+dish embedding 8 · **co-menu off** · **headcount band on** · calibration off · re-basing ·
+5 averaged models · Adam, learning rate 0.003 · batch 32 · early stopping 5 · kind of day from the
+menu · validation = newest 10% of training rows · internal test = 5% of days.
 
 **Results:**
 
 | Set | Within 5 g | Within ±10% |
 |---|---|---|
-| Test sets | 203/255 | 227/255 |
-| October walk-forward | 104/135 | 115/135 |
-| No-model baseline | 131/255 | — |
+| Test sets (corrected) | 161/255 | 180/255 |
+| October walk-forward | 91/135 | 98/135 |
+| No-model baseline | 101/255 | 121/255 |
+
+Numbers from before 20 Nov were measured against the old quantities and are not comparable.
 
 For a new client these settings are one candidate to test, not the default: start from
 `DEFAULT_PARAMS`, record that baseline, then follow Part 1.
 
 **Still open for Clario:**
 - **Shortages:** the run-out headcount (B11).
-- **The menu:** the co-menu adds nothing at present (I10).
+- **24 Jun 2026:** vendor MG 35 for client MG 160 in the cleaned file. Probably 135; waiting on
+  the kitchen.
+- **The model now leans over:** bias +3.2 g on the test days, 63 kg short vs 171 kg over. It
+  traded shortages for waste.
 - **Waiting on the kitchen:** everyday bread (60 or 66 g) and Wednesday Healthy Rice (100 or
   120 g).
 - **Speed:** H2.
