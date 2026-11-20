@@ -77,6 +77,8 @@ SPACE = {
     "calibrate":      [False, True],
     "rebase":         [False, True],
     "ensemble":       [1, 3],
+    "mg_band":        [False, True],
+    "co_menu":        [True, False],
 }
 
 

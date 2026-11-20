@@ -70,6 +70,8 @@ SETTING_NOTES = {
     "rebase":        "TRUE = scale past rows to today's standard portions (data/<client>_standard_portions.csv)",
     "early_stopping": "always on: stop after N epochs without improvement, keep the best (epochs = maximum)",
     "ensemble":      "how many models (different random starts) are trained and averaged; 1 = a single model",
+    "mg_band":       "TRUE = the day's client MG, in bands (60 / 80 / 120 / 160), is an input",
+    "co_menu":       "FALSE = ignore the other dishes on the day's menu",
     "item_emb_dim":  "embedding width for the dish and its co-menu",
     "val_split":     "fraction of training rows watched as validation",
     "test_size":     "fraction of dataset days held out as the internal test set",
@@ -472,7 +474,7 @@ def parse_settings(path):
             v = sheet.at[key, name]
             if key == "dense_units":
                 params[key] = [int(float(u)) for u in str(v).split(",")]
-            elif key in ("mask_padding", "calibrate", "rebase"):
+            elif key in ("mask_padding", "calibrate", "rebase", "mg_band", "co_menu"):
                 params[key] = str(v).strip().lower() in ("true", "1", "yes")
             elif key in ("optimizer", "loss", "activation", "target_mode"):
                 params[key] = str(v).strip().lower()

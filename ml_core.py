@@ -73,6 +73,11 @@ DEFAULT_PARAMS = {
     # How many models are trained (same data, different random starts) and averaged.
     # Averaging cancels each model's random quirks: steadier, and it cannot overfit more.
     "ensemble":      1,
+    # TRUE: the day's client MG, in bands (mg_band), is an input. Clario cooks for the vendor MG,
+    # a smaller share of the client MG on bigger days, so the per-client-person portion depends on it.
+    "mg_band":       False,
+    # FALSE: the model ignores the other dishes on the day's menu (the co-menu input is zeroed).
+    "co_menu":       True,
     "val_split":     VAL_SPLIT,
     "test_size":     TEST_SIZE,
 }
@@ -119,7 +124,7 @@ def validate_params(params, where):
         raise ValueError(f"{where}: loss_delta={params['loss_delta']!r} — must be above 0 (kg).")
     if "seed" in params and not (isinstance(params["seed"], int) and params["seed"] >= 0):
         raise ValueError(f"{where}: seed={params['seed']!r} — must be a whole number, 0 or more.")
-    for k in ("mask_padding", "calibrate", "rebase"):
+    for k in ("mask_padding", "calibrate", "rebase", "mg_band", "co_menu"):
         if k in params and not isinstance(params[k], bool):
             raise ValueError(f"{where}: {k}={params[k]!r} — must be true or false.")
     for k in ("epochs", "batch", "item_emb_dim", "ensemble"):
@@ -159,6 +164,12 @@ def data_sha(ck, dataset_path, params):
     so editing either marks the model out of date."""
     sha = file_sha(dataset_path)
     return f"{sha}+{file_sha(standards_path(ck))}" if params.get("rebase") else sha
+
+MG_BANDS = (60, 80, 120, 160)   # Clario's vendor ÷ client MG falls from ~0.93 (≤60) to ~0.84 (>160) across these
+
+def mg_band(mg):
+    """The client MG's band, "0" (≤60) to "4" (>160): the headcount input when the mg_band setting is on."""
+    return str(sum(float(mg or 0) > edge for edge in MG_BANDS))
 
 NONVEG_DAY_ORDER = ("non-veg biryani", "non-veg gravy", "non-veg dry")   # the kitchen plans around the first
 
@@ -516,6 +527,8 @@ def prepare_dataset(ck, path, logic):
 
     # Derive weekday from date (not stored in most datasets).
     df["weekday"] = df["date"].dt.day_name().map(norm)
+    if "client_mg" in df.columns:   # the headcount input, used only when the mg_band setting is on
+        df["mg_band"] = df["client_mg"].map(mg_band)
 
     for col in logic.encoder_columns:
         if col not in df.columns and col in autofill_defaults:
@@ -686,11 +699,11 @@ def build_model(encoders, feature_cols, params):
     ctx_emb  = tf.keras.layers.Embedding(vocab_size + 1, item_dim)(inp_ctx)
     # mask_padding: average only the real co-menu dishes. Without it, a day with
     # 4 other dishes averages 4 real embeddings with 6 copies of the pad slot.
-    embeddings = [
-        tf.keras.layers.Flatten()(item_emb),
-        masked_mean(ctx_emb, inp_ctx, vocab_size) if params["mask_padding"]
-        else tf.keras.layers.GlobalAveragePooling1D()(ctx_emb),
-    ]
+    ctx = (masked_mean(ctx_emb, inp_ctx, vocab_size) if params["mask_padding"]
+           else tf.keras.layers.GlobalAveragePooling1D()(ctx_emb))
+    if not params["co_menu"]:   # the model ignores the rest of the day's menu (layers kept for the same start)
+        ctx = tf.keras.ops.zeros_like(ctx)
+    embeddings = [tf.keras.layers.Flatten()(item_emb), ctx]
 
     for col in feature_cols:
         inp = tf.keras.Input(shape=(1,), name=col)
@@ -751,7 +764,7 @@ def train_model(ck, path, logic, verbose=0, params=None, note=""):
     joblib.dump(item_to_cat,    _ap(ck, "item_to_cat.pkl"))
     joblib.dump(build_cat_to_subs(item_to_cat, item_to_subcat), _ap(ck, "cat_to_subs.pkl"))
 
-    columns = list(logic.encoder_columns)
+    columns = list(logic.encoder_columns) + (["mg_band"] if params["mg_band"] else [])
     encoders = fit_encoders(df, columns)
     for col, le in encoders.items():
         joblib.dump(le, _ap(ck, f"{col}_encoder.pkl"))
@@ -982,6 +995,7 @@ def predict(ck, item, menu, mg, subcat, cat, weekday, logic,
         "day_type":      logic.canonicalize_day_type(day_type or "regular"),
         "holiday_type":  logic.canonicalize_holiday_type(holiday_type or "not applicable"),
         "meal_day":      logic.canonicalize_meal_day(meal_day or "veg"),
+        "mg_band":       mg_band(mg),
     }
 
     # Load all encoders before the loop — one cache lookup per column, not one per iteration.
